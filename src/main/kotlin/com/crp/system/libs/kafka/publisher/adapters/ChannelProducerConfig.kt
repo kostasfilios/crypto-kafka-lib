@@ -3,9 +3,12 @@ package com.crp.system.libs.kafka.publisher.adapters
 import com.crp.system.libs.kafka.publisher.spring.ProducerSettings
 import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.common.serialization.StringSerializer
+import org.slf4j.LoggerFactory
 
 /** The channel's producer config: the service's connection settings (from the one KafkaTemplate) + the channel's limits. */
 internal object ChannelProducerConfig {
+    private val logger = LoggerFactory.getLogger(ChannelProducerConfig::class.java)
+
     fun build(shared: Map<String, Any>, channel: String, settings: ProducerSettings, applicationName: String): Map<String, Any> =
         HashMap(shared).apply {
             remove(ProducerConfig.TRANSACTIONAL_ID_CONFIG) // never transactional (AD9)
@@ -21,5 +24,8 @@ internal object ChannelProducerConfig {
             put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, settings.deliveryTimeoutMs)
             put(ProducerConfig.COMPRESSION_TYPE_CONFIG, settings.compressionType)
             putAll(settings.extra)
+            if (remove(ProducerConfig.TRANSACTIONAL_ID_CONFIG) != null) { // `extra` cannot make a channel transactional either
+                logger.warn("kafka_publisher_extra_ignored channel={} key={} reason=never_transactional", channel, ProducerConfig.TRANSACTIONAL_ID_CONFIG)
+            }
         }
 }

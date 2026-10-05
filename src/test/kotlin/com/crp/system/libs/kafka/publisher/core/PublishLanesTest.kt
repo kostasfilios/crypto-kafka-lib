@@ -26,7 +26,7 @@ class PublishLanesTest {
     fun cleanUp() = cleanups.reversed().forEach { it() }
 
     private fun lanes(name: String, count: Int, capacity: Int, ordering: OrderingMode = OrderingMode.PER_KEY): PublishLanes =
-        PublishLanes(name, count, capacity, ordering).also { lanes -> cleanups += { lanes.drainAndStop(System.nanoTime() + 2_000_000_000) } }
+        PublishLanes(name, count, capacity, ordering).also { lanes -> cleanups += { lanes.stopAccepting(); lanes.awaitDrained(System.nanoTime() + 2_000_000_000) } }
 
     /** Two keys whose hashes pick different lanes out of [count]. */
     private fun keysOnDifferentLanes(count: Int): Pair<String, String> {

@@ -13,9 +13,16 @@ import com.crp.system.libs.kafka.publisher.testsupport.SampleEvent
 import com.crp.system.libs.kafka.publisher.testsupport.awaitFailure
 import com.crp.system.libs.kafka.publisher.testsupport.awaitResult
 import com.crp.system.libs.kafka.publisher.api.PublisherMetrics
+import com.crp.system.libs.kafka.publisher.api.TopicCoolingDownException
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.apache.kafka.clients.admin.AdminClientConfig
+import org.apache.kafka.clients.producer.BufferExhaustedException
+import org.apache.kafka.clients.producer.Callback
 import org.apache.kafka.clients.producer.MockProducer
+import org.apache.kafka.clients.producer.Producer
+import org.apache.kafka.clients.producer.ProducerRecord
+import org.apache.kafka.clients.producer.RecordMetadata
+import org.apache.kafka.common.errors.RecordTooLargeException
 import org.apache.kafka.common.errors.TimeoutException
 import org.apache.kafka.common.serialization.StringSerializer
 import org.assertj.core.api.Assertions.assertThat
@@ -26,10 +33,11 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 
 class KafkaRecordSenderTest {
-    private val record = OutboundRecord("reporting", "t1", "42", """{"a":1}""", mapOf("source_service" to "KYCService", "trace" to "αβγ"), Instant.EPOCH)
+    private val record = OutboundRecord("reporting", "t1", "42", """{"a":1}""", mapOf("source_service" to "KYCService", "trace" to "αβγ"), 0L)
 
     @Test
     fun `sends a keyed record with UTF-8 headers and reports the acknowledgement`() {
@@ -86,6 +94,64 @@ class KafkaRecordSenderTest {
     }
 }
 
+/** Which failures the Kafka sender reports as a topic missing from the broker's metadata (Ruling L-3's trigger). */
+class KafkaRecordSenderMissingTopicTest {
+    private val record = OutboundRecord("reporting", "t1", "42", "{}", emptyMap(), 0L)
+    private val metadataTimeout = TimeoutException("Topic t1 not present in metadata after 2000 ms.")
+
+    /** Answers send() through the callback: inside send() like KafkaProducer's metadata wait, or later from another thread. */
+    private class CallbackProducer(private val error: Exception, private val fromOtherThread: Boolean) :
+        Producer<String, String> by MockProducer(true, StringSerializer(), StringSerializer()) {
+        override fun send(record: ProducerRecord<String, String>, callback: Callback): Future<RecordMetadata> {
+            if (fromOtherThread) Thread { callback.onCompletion(null, error) }.apply { start(); join() } else callback.onCompletion(null, error)
+            return CompletableFuture.completedFuture(null)
+        }
+    }
+
+    private fun outcomeOf(producer: Producer<String, String>): SendOutcome {
+        val outcome = CompletableFuture<SendOutcome>()
+        KafkaRecordSender(producer).send(record) { outcome.complete(it) }
+        return outcome.awaitResult()
+    }
+
+    @Test
+    fun `a metadata timeout reported inside send() is a missing topic`() {
+        assertThat(outcomeOf(CallbackProducer(metadataTimeout, fromOtherThread = false))).isEqualTo(SendOutcome.Failed(metadataTimeout, topicMissing = true))
+    }
+
+    @Test
+    fun `a full buffer is a TimeoutException too, but not a missing topic`() {
+        val full = BufferExhaustedException("Failed to allocate memory within the configured max blocking time 2000 ms.")
+        assertThat(outcomeOf(CallbackProducer(full, fromOtherThread = false))).isEqualTo(SendOutcome.Failed(full, topicMissing = false))
+    }
+
+    @Test
+    fun `a timeout the producer reports from its network thread is not a missing topic`() {
+        assertThat(outcomeOf(CallbackProducer(metadataTimeout, fromOtherThread = true))).isEqualTo(SendOutcome.Failed(metadataTimeout, topicMissing = false))
+    }
+
+    @Test
+    fun `a callback that runs after send() returned is not a missing topic, even on the same thread`() {
+        var held: Callback? = null
+        val producer = object : Producer<String, String> by MockProducer(true, StringSerializer(), StringSerializer()) {
+            override fun send(record: ProducerRecord<String, String>, callback: Callback): Future<RecordMetadata> {
+                held = callback
+                return CompletableFuture.completedFuture(null)
+            }
+        }
+        val outcome = CompletableFuture<SendOutcome>()
+        KafkaRecordSender(producer).send(record) { outcome.complete(it) }
+        held!!.onCompletion(null, metadataTimeout)
+        assertThat(outcome.awaitResult()).isEqualTo(SendOutcome.Failed(metadataTimeout, topicMissing = false))
+    }
+
+    @Test
+    fun `other errors reported inside send() are not a missing topic`() {
+        val tooLarge = RecordTooLargeException("too large")
+        assertThat(outcomeOf(CallbackProducer(tooLarge, fromOtherThread = false))).isEqualTo(SendOutcome.Failed(tooLarge, topicMissing = false))
+    }
+}
+
 /**
  * The proposal's "missing topic" case against a real KafkaProducer: no broker answers, so the topic never appears in
  * metadata and the producer reports it through the callback after `max-block-ms` (2000 ms by default) as DELIVERY_FAILED.
@@ -120,6 +186,13 @@ class RealProducerMissingTopicTest {
             assertThat(failure.cause).isInstanceOf(TimeoutException::class.java)
                 .hasMessageContaining("not present in metadata after 2000 ms")
             assertThat(handler.failures.single().stage).isEqualTo(DELIVERY_FAILED)
+
+            // the topic now cools down: the next send to it fails at once instead of blocking the lane for max-block-ms again
+            val again = System.nanoTime()
+            val cooled = channels.get("reporting").publishWithResult("event-publisher-test-missing", "42", SampleEvent("x", "42")).awaitFailure()
+            assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - again)).isLessThan(500)
+            assertThat(cooled.stage).isEqualTo(DELIVERY_FAILED)
+            assertThat(cooled.cause).isInstanceOf(TopicCoolingDownException::class.java)
         } finally {
             channels.close()
         }
@@ -214,6 +287,7 @@ class PipelineWithMockProducerTest {
         try {
             val result = channels.get("reporting").publishWithResult("t1", "42", SampleEvent("player_registered", "42"), mapOf("h" to "v")).awaitResult()
             assertThat(result.topic).isEqualTo("t1")
+            assertThat(result.latency).isPositive() // measured on the real monotonic clock by default
             assertThat(producer.history().single().value()).isEqualTo("""{"event_type":"player_registered","player_id":"42","seq":0}""")
         } finally {
             channels.close()

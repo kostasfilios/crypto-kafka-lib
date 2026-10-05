@@ -96,6 +96,30 @@ class RecordingEventPublisherTest {
     }
 
     @Test
+    fun `null arguments are rejected like the real channel does, never thrown`() {
+        val reporting = RecordingEventPublisherChannels().get("reporting")
+        assertDoesNotThrow { reporting.publish(null, "1", event) }
+        assertDoesNotThrow { reporting.publish("t1", "2", null) }
+        assertDoesNotThrow { reporting.publishJson("t1", "3", null) }
+        assertThat(reporting.publishWithResult("t1", "4", null).awaitFailure().stage).isEqualTo(PublishFailureStage.SERIALIZATION)
+        assertThat(reporting.failures.map { it.stage to it.key }).containsExactly(
+            PublishFailureStage.INTERNAL to "1",
+            PublishFailureStage.SERIALIZATION to "2",
+            PublishFailureStage.SERIALIZATION to "3",
+            PublishFailureStage.SERIALIZATION to "4",
+        )
+        assertThat(reporting.recorded).isEmpty()
+    }
+
+    @Test
+    fun `headers are recorded as the real channel sends them`() {
+        val reporting = RecordingEventPublisherChannels().get("reporting")
+        reporting.publish("t1", "1", event, mapOf("kept" to "1", "dropped" to null))
+        reporting.publish("t1", "2", event, null)
+        assertThat(reporting.recorded.map { it.headers }).containsExactly(mapOf("kept" to "1"), emptyMap())
+    }
+
+    @Test
     fun `names, clear, and an unused channel`() {
         val channels = RecordingEventPublisherChannels()
         channels.get("reporting").publish("t1", "1", event)

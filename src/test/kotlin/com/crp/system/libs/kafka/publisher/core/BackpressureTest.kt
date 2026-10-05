@@ -51,7 +51,7 @@ class BackpressureTest {
     @Test
     fun `DROP drops on the caller without waiting, and the logging handler gives one summary with the count`() {
         val clock = MutableClock()
-        val logging = LoggingPublishFailureHandler(Duration.ofSeconds(10), clock)
+        val logging = LoggingPublishFailureHandler(Duration.ofSeconds(10), clock::nanoTime)
         LogCapture(LoggingPublishFailureHandler::class.java).use { logs ->
             val h = fullLane(BackpressureMode.DROP, clock = clock, logging = logging)
 
@@ -121,6 +121,20 @@ class BackpressureTest {
         assertThat(stillInterrupted).isTrue()
         assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)).isLessThan(5_000)
         assertThat(h.handler.single().stage).isEqualTo(QUEUE_FULL)
+    }
+
+    @Test
+    fun `BLOCK_WITH_TIMEOUT admits a caller with a pending interrupt when the lane has room, and keeps the interrupt`() {
+        val h = Harness(settings = ChannelSettings(enabled = true, lanes = 1, queueCapacity = 4, backpressure = BackpressureMode.BLOCK_WITH_TIMEOUT))
+            .also { harnesses += it }
+
+        Thread.currentThread().interrupt()
+        val result = h.publisher.publishWithResult("t1", "interrupted-but-room", event)
+        val stillInterrupted = Thread.interrupted()
+
+        assertThat(stillInterrupted).isTrue()
+        assertThat(result.awaitResult().key).isEqualTo("interrupted-but-room")
+        assertThat(h.handler.failures).isEmpty()
     }
 
     @Test

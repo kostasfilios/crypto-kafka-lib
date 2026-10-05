@@ -55,8 +55,14 @@ data class ProducerSettings(
     val deliveryTimeoutMs: Int = 30_000,
     val acks: String = "all",
     val compressionType: String = "none",
-    /** Any other ProducerConfig key, applied last. */
+    /** Any other ProducerConfig key, applied last (`transactional.id` is always removed: a channel is never transactional). */
     val extra: Map<String, String> = emptyMap(),
+    /**
+     * After the producer cannot find a topic in the broker's metadata within `max-block-ms`, sends to that topic fail at
+     * once (DELIVERY_FAILED, `TopicCoolingDownException`) for this long, so one missing topic cannot stall its lanes;
+     * then one send checks the topic again. 0 turns it off. Not a Kafka setting.
+     */
+    val missingTopicCooldown: Duration = Duration.ofSeconds(30),
 )
 
 enum class SerializerNaming { SNAKE_CASE, IDENTITY }

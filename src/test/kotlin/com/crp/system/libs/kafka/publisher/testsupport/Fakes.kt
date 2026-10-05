@@ -23,13 +23,25 @@ import java.util.concurrent.locks.LockSupport
 
 const val WAIT_SECONDS = 10L
 
-/** A Clock the test moves by hand. */
-class MutableClock(start: Instant = Instant.parse("2026-10-05T12:00:00Z")) : Clock() {
+/** A Clock the test moves by hand, with a monotonic counterpart ([nanoTime]) that only moves forward with [advance]. */
+class MutableClock(start: Instant = Instant.parse("2026-10-05T12:00:00Z"), startNanos: Long = 1_000_000_000L) : Clock() {
     private val now = AtomicReference(start)
+    private val nanos = AtomicLong(startNanos)
     override fun instant(): Instant = now.get()
     override fun getZone(): ZoneId = ZoneOffset.UTC
     override fun withZone(zone: ZoneId?): Clock = this
+
+    /** The monotonic source to inject where the code would call `System.nanoTime()`. */
+    fun nanoTime(): Long = nanos.get()
+
+    /** Time passes: the wall clock and the monotonic clock both move. */
     fun advance(by: Duration) {
+        now.updateAndGet { it.plus(by) }
+        nanos.addAndGet(by.toNanos())
+    }
+
+    /** Only the wall clock jumps (NTP, a VM resume); monotonic time does not. */
+    fun stepWallClock(by: Duration) {
         now.updateAndGet { it.plus(by) }
     }
 }
@@ -52,9 +64,13 @@ internal class FakeRecordSender(@Volatile var script: SendScript = deliver()) : 
         script(record, index, onOutcome)
     }
 
+    /** Runs on close, like a real producer whose close wakes a send blocked in it. */
+    @Volatile var onClose: () -> Unit = {}
+
     override fun close(timeout: Duration) {
         callsBeforeClose = calls.size
         closes += timeout
+        onClose()
     }
 
     /** Waits for the next send call (in call order). */
@@ -69,6 +85,11 @@ internal class FakeRecordSender(@Volatile var script: SendScript = deliver()) : 
         fun deliver(partition: Int = 0): SendScript = { _, _, onOutcome -> onOutcome(SendOutcome.Delivered(partition, offsets.incrementAndGet())) }
 
         fun fail(error: Exception): SendScript = { _, _, onOutcome -> onOutcome(SendOutcome.Failed(error)) }
+
+        /** What the Kafka sender reports, inside send(), for a topic missing from the broker's metadata after max-block-ms. */
+        fun topicMissing(topic: String = "t1"): SendScript = { _, _, onOutcome ->
+            onOutcome(SendOutcome.Failed(org.apache.kafka.common.errors.TimeoutException("Topic $topic not present in metadata after 2000 ms."), topicMissing = true))
+        }
 
         fun throwing(error: Exception): SendScript = { _, _, _ -> throw error }
 

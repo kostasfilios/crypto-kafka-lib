@@ -1,10 +1,12 @@
 package com.crp.system.libs.kafka.publisher.core
 
+import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.INTERNAL
 import com.crp.system.libs.kafka.publisher.spring.OrderingMode
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /** PER_KEY: the key's hash picks the lane, so one key always uses one FIFO lane. NONE or a null key: round-robin. */
@@ -18,22 +20,27 @@ internal class PublishLanes(channel: String, count: Int, totalCapacity: Int, pri
 
     fun queued(): Int = lanes.sumOf { it.queued() }
 
-    /** Stop accepting, then let every lane drain until [deadlineNanos] (a `System.nanoTime()` deadline). */
-    fun drainAndStop(deadlineNanos: Long) {
-        lanes.forEach { it.stopAccepting() }
-        lanes.forEach { it.awaitDrained(deadlineNanos) }
-    }
+    fun stopAccepting() = lanes.forEach { it.stopAccepting() }
+
+    /** Lets every lane drain until [deadlineNanos] (a `System.nanoTime()` deadline). */
+    fun awaitDrained(deadlineNanos: Long) = lanes.forEach { it.awaitDrained(deadlineNanos) }
+
+    /** Takes whatever is still queued out of every lane. */
+    fun takeRemaining(): List<Runnable> = lanes.flatMap { it.takeRemaining() }
 }
 
 /** One worker thread over one bounded queue. JDK only: no Reactor in the lib. */
 internal class PublishLane(val name: String, capacity: Int) {
     private val queue = ArrayBlockingQueue<Runnable>(capacity)
     @Volatile private var accepting = true
-    private val worker = Thread(::work, name).apply { isDaemon = true; start() }
+    private val restarted = AtomicBoolean(false)
+    @Volatile private var worker: Thread = startWorker()
 
     fun tryEnqueue(task: Runnable): Boolean = admitted(task, accepting && queue.offer(task))
 
-    fun enqueueWaiting(task: Runnable, timeout: Duration): Boolean = admitted(task, accepting && offerWaiting(task, timeout))
+    /** A free slot is taken at once, even by a caller with a pending interrupt; only a full lane makes the caller wait. */
+    fun enqueueWaiting(task: Runnable, timeout: Duration): Boolean =
+        admitted(task, accepting && (queue.offer(task) || offerWaiting(task, timeout)))
 
     fun queued(): Int = queue.size
 
@@ -41,13 +48,22 @@ internal class PublishLane(val name: String, capacity: Int) {
         accepting = false
     }
 
+    /** Waits until the worker has left (its queue drained) or [deadlineNanos]; follows a restarted worker. */
     fun awaitDrained(deadlineNanos: Long) {
         try {
-            worker.join(TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).coerceAtLeast(1))
+            while (true) {
+                val current = worker
+                if (current === Thread.currentThread()) return // close() called from this lane's own task: never wait for ourselves
+                current.join(TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).coerceAtLeast(1))
+                if (current === worker || deadlineNanos - System.nanoTime() <= 0) return
+            }
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
         }
     }
+
+    /** Takes everything still queued out of the lane (shutdown after its deadline, or a worker that died for good). */
+    fun takeRemaining(): List<Runnable> = ArrayList<Runnable>().also { queue.drainTo(it) }
 
     /** A close that raced the offer may have let the worker exit already: take the task back so the caller reports it. */
     private fun admitted(task: Runnable, offered: Boolean): Boolean = offered && (accepting || !queue.remove(task))
@@ -60,7 +76,17 @@ internal class PublishLane(val name: String, capacity: Int) {
             false
         }
 
+    private fun startWorker(): Thread = Thread(::work, name).apply { isDaemon = true; start() }
+
     private fun work() {
+        try {
+            loop()
+        } catch (died: Throwable) {
+            workerDied(died)
+        }
+    }
+
+    private fun loop() {
         while (accepting || queue.isNotEmpty()) {
             val task = try {
                 queue.poll(100, TimeUnit.MILLISECONDS)
@@ -73,6 +99,37 @@ internal class PublishLane(val name: String, capacity: Int) {
                 // tasks guard themselves; this keeps the lane alive
                 logger.error("kafka_publisher_lane_task_failed lane={}: {}", name, e.toString())
             }
+        }
+    }
+
+    /**
+     * The worker left its loop on an unexpected Throwable. It is restarted once; if it dies again, or no thread can be
+     * started, the lane stops accepting and gives its queued records up as INTERNAL instead of stranding them.
+     */
+    private fun workerDied(cause: Throwable) {
+        if (restarted.compareAndSet(false, true)) {
+            val replacement = try {
+                startWorker()
+            } catch (e: Throwable) {
+                null
+            }
+            if (replacement != null) {
+                worker = replacement
+                quietly { logger.error("kafka_publisher_lane_restarted lane={} cause={}", name, describe(cause)) }
+                return
+            }
+        }
+        accepting = false
+        val stranded = takeRemaining().filterIsInstance<LaneTask>()
+        quietly { logger.error("kafka_publisher_lane_dead lane={} abandoned={} cause={}", name, stranded.size, describe(cause)) }
+        for (task in stranded) quietly { task.abandon(INTERNAL, cause) }
+    }
+
+    private inline fun quietly(block: () -> Unit) {
+        try {
+            block()
+        } catch (ignored: Throwable) {
+            // the lane is already in trouble; nothing left to report to
         }
     }
 

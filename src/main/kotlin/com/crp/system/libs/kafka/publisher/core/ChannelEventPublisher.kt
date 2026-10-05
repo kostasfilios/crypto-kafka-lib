@@ -13,6 +13,7 @@ import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.SERIALIZATION
 import com.crp.system.libs.kafka.publisher.api.PublishResult
 import com.crp.system.libs.kafka.publisher.api.PublisherMetrics
 import com.crp.system.libs.kafka.publisher.api.RetryPolicy
+import com.crp.system.libs.kafka.publisher.api.TopicCoolingDownException
 import com.crp.system.libs.kafka.publisher.spring.ChannelSettings
 import org.slf4j.LoggerFactory
 import java.time.Clock
@@ -39,28 +40,43 @@ internal class ChannelEventPublisher(
     private val failures: FailureDispatcher,
     private val metrics: PublisherMetrics,
     private val clock: Clock,
+    /** Monotonic time for latency and cool-downs. Waits (shutdown) always use the real `System.nanoTime()`. */
+    private val nanoTime: () -> Long,
+    private val warnInterval: Duration,
 ) : EventPublisher {
 
     private val open = AtomicBoolean(true)
     private val pendingRetries: MutableSet<PendingRetry> = ConcurrentHashMap.newKeySet()
+    private val metricsWarnings = RateLimiter<String>(warnInterval, nanoTime)
+    private val cooldownNanos = settings.producer.missingTopicCooldown.saturatedNanos()
 
-    override fun publish(topic: String, key: String?, event: Any, headers: Map<String, String>) =
-        accept(topic, key, headers, result = null) { serializer.serialize(event) }
+    /** Topic -> monotonic time until which sends to it fail at once: it was missing from the broker's metadata. */
+    private val coolingDown = ConcurrentHashMap<String, Long>()
 
-    override fun publishJson(topic: String, key: String?, json: String, headers: Map<String, String>) =
-        accept(topic, key, headers, result = null) { json }
+    val shutdownTimeout: Duration get() = settings.shutdownTimeout
 
-    override fun publishWithResult(topic: String, key: String?, event: Any, headers: Map<String, String>): CompletableFuture<PublishResult> =
-        CompletableFuture<PublishResult>().also { result -> accept(topic, key, headers, result) { serializer.serialize(event) } }
+    override fun publish(topic: String?, key: String?, event: Any?, headers: Map<String, String?>?) =
+        accept(topic, key, headers, result = null) { serializer.serialize(event ?: throw IllegalArgumentException("publish called with a null event")) }
 
-    /** Caller thread. Never throws: an Error from a serializer (a cyclic graph's StackOverflowError) is a failure too. */
+    override fun publishJson(topic: String?, key: String?, json: String?, headers: Map<String, String?>?) =
+        accept(topic, key, headers, result = null) { json ?: throw IllegalArgumentException("publishJson called with null json") }
+
+    override fun publishWithResult(topic: String?, key: String?, event: Any?, headers: Map<String, String?>?): CompletableFuture<PublishResult> =
+        CompletableFuture<PublishResult>().also { result ->
+            accept(topic, key, headers, result) { serializer.serialize(event ?: throw IllegalArgumentException("publishWithResult called with a null event")) }
+        }
+
+    /** Caller thread. Never throws: bad arguments and an Error from a serializer (a cyclic graph) are failures too. */
     private fun accept(
-        topic: String,
+        topic: String?,
         key: String?,
-        headers: Map<String, String>,
+        headers: Map<String, String?>?,
         result: CompletableFuture<PublishResult>?,
         payload: () -> String,
     ) {
+        if (topic == null) {
+            return failures.fail(INTERNAL, "", key, attempt = 0, cause = IllegalArgumentException("publish called with a null topic"), payload = null, result = result)
+        }
         try {
             if (!open.get()) return failures.fail(CHANNEL_UNAVAILABLE, topic, key, attempt = 0, cause = null, payload = null, result = result)
             val json = try {
@@ -68,8 +84,8 @@ internal class ChannelEventPublisher(
             } catch (e: Throwable) {
                 return failures.fail(SERIALIZATION, topic, key, attempt = 0, cause = e, payload = null, result = result)
             }
-            val record = OutboundRecord(channel, topic, key, json, headers.toMap(), clock.instant())
-            if (!backpressure.admit(lanes.forKey(key)) { send(record, attempt = 1, result) }) {
+            val record = OutboundRecord(channel, topic, key, json, headerSnapshot(headers), nanoTime())
+            if (!backpressure.admit(lanes.forKey(key), SendTask(record, attempt = 1, result, previousError = null))) {
                 failures.fail(QUEUE_FULL, topic, key, attempt = 0, cause = null, payload = json, result = result)
             }
         } catch (e: Throwable) {
@@ -79,12 +95,24 @@ internal class ChannelEventPublisher(
 
     /** Lane thread (the caller under CALLER_RUNS; the maintenance thread for a retry). Never throws. */
     private fun send(record: OutboundRecord, attempt: Int, result: CompletableFuture<PublishResult>?) {
+        val cooldown = cooldownFor(record.topic)
+        if (cooldown is Cooldown.Active) return failCoolingDown(record, attempt, cooldown.untilNanos, result)
         val settled = AtomicBoolean(false) // one outcome per attempt, even from a sender that both calls back and throws
+        var topicMissing = false // set by an outcome reported inside sender.send (the only way a missing topic is reported)
         try {
-            sender.send(record) { outcome -> if (settled.compareAndSet(false, true)) onOutcome(record, attempt, result, outcome) }
+            sender.send(record) { outcome ->
+                if (settled.compareAndSet(false, true)) {
+                    if (outcome is SendOutcome.Failed && outcome.topicMissing) {
+                        topicMissing = true
+                        startCooldown(record.topic)
+                    }
+                    onOutcome(record, attempt, result, outcome)
+                }
+            }
         } catch (e: Throwable) {
             if (settled.compareAndSet(false, true)) retryOrFail(SEND_REJECTED, record, attempt, e, result)
         }
+        if (cooldown is Cooldown.Probe && !topicMissing) coolingDown.remove(record.topic, cooldown.token) // the topic is back
     }
 
     /** Producer I/O thread, or the lane for errors the producer reports at once. Never throws. */
@@ -92,11 +120,11 @@ internal class ChannelEventPublisher(
         try {
             when (outcome) {
                 is SendOutcome.Delivered -> {
-                    val latency = Duration.between(record.enqueuedAt, clock.instant())
+                    val latency = Duration.ofNanos((nanoTime() - record.enqueuedNanos).coerceAtLeast(0))
                     try {
                         metrics.delivered(channel, record.topic, latency)
                     } catch (e: Throwable) {
-                        logger.warn("kafka_publisher_metrics_failed channel={}: {}", channel, e.toString())
+                        if (metricsWarnings.admit(DELIVERED)) logger.warn("kafka_publisher_metrics_failed channel={}: {}", channel, describe(e))
                     }
                     result?.complete(PublishResult(channel, record.topic, record.key, outcome.partition, outcome.offset, attempt, latency))
                 }
@@ -139,13 +167,91 @@ internal class ChannelEventPublisher(
         failures.fail(stage, record.topic, record.key, attempt, error, record.payload, result, retriable)
     }
 
-    /** Stop accepting, fail pending retries, let the lanes drain until the deadline, then close the producer with the time left. */
-    fun close() {
-        if (!open.compareAndSet(true, false)) return
-        val deadlineNanos = System.nanoTime() + settings.shutdownTimeout.toNanos()
+    // ── missing-topic cool-down (Ruling L-3) ──────────────────────────────────────────────────────────────
+
+    private sealed interface Cooldown {
+        object None : Cooldown
+        class Probe(val token: Long) : Cooldown
+        class Active(val untilNanos: Long) : Cooldown
+    }
+
+    /** None: send. Probe: the cool-down is over and this send is the one that checks the topic. Active: fail at once. */
+    private fun cooldownFor(topic: String): Cooldown {
+        val until = coolingDown[topic] ?: return Cooldown.None
+        val now = nanoTime()
+        if (now - until < 0) return Cooldown.Active(until)
+        val token = now + cooldownNanos // while this send probes, the others keep failing fast
+        if (coolingDown.replace(topic, until, token)) return Cooldown.Probe(token)
+        val current = coolingDown[topic] ?: return Cooldown.None
+        return if (now - current < 0) Cooldown.Active(current) else Cooldown.None
+    }
+
+    private fun startCooldown(topic: String) {
+        if (cooldownNanos <= 0) return
+        coolingDown[topic] = nanoTime() + cooldownNanos
+        try {
+            logger.warn("kafka_publisher_topic_cooling_down channel={} topic={} for={}", channel, topic, settings.producer.missingTopicCooldown)
+        } catch (ignored: Throwable) {
+            // the outcome must still be reported
+        }
+    }
+
+    private fun failCoolingDown(record: OutboundRecord, attempt: Int, untilNanos: Long, result: CompletableFuture<PublishResult>?) {
+        val until = clock.instant().plusNanos(untilNanos - nanoTime())
+        failures.fail(DELIVERY_FAILED, record.topic, record.key, attempt - 1, TopicCoolingDownException(record.topic, until), record.payload, result)
+    }
+
+    // ── shutdown ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /** Phase 1 of close: refuse new records, fail pending retries, stop the lanes accepting. False when already closing. */
+    fun beginClose(): Boolean {
+        if (!open.compareAndSet(true, false)) return false
         pendingRetries.toList().forEach { it.abandon() } // nothing is retried during shutdown
-        lanes.drainAndStop(deadlineNanos)
-        sender.close(Duration.ofNanos((deadlineNanos - System.nanoTime()).coerceAtLeast(0)))
+        lanes.stopAccepting()
+        return true
+    }
+
+    /**
+     * Phase 2: let the lanes drain until [deadlineNanos] (a `System.nanoTime()` deadline), close the producer with the
+     * time left, then fail whatever is still queued as CHANNEL_UNAVAILABLE, so no future outlives close(), and count it.
+     */
+    fun finishClose(deadlineNanos: Long) {
+        lanes.awaitDrained(deadlineNanos)
+        try {
+            sender.close(Duration.ofNanos((deadlineNanos - System.nanoTime()).coerceAtLeast(0)))
+        } catch (e: Throwable) {
+            logger.warn("kafka_publisher_producer_close_failed channel={}: {}", channel, describe(e))
+        }
+        val abandoned = lanes.takeRemaining().filterIsInstance<LaneTask>()
+        abandoned.forEach { it.abandon(CHANNEL_UNAVAILABLE, null) }
+        lanes.awaitDrained(System.nanoTime() + IN_FLIGHT_GRACE_NANOS) // in-flight sends return once the producer is closed
+        if (abandoned.isNotEmpty()) logger.warn("kafka_publisher_shutdown_abandoned channel={} count={}", channel, abandoned.size)
+    }
+
+    /** Stop accepting, fail pending retries, drain until the shutdown timeout, close the producer, give up the rest. */
+    fun close() {
+        if (beginClose()) finishClose(System.nanoTime() + settings.shutdownTimeout.saturatedNanos())
+    }
+
+    /** Run with the failure summaries: the WARNs held back since the last run. */
+    fun flushWarnings() {
+        failures.flushWarnings()
+        metricsWarnings.flush { _, count ->
+            logger.warn("kafka_publisher_metrics_failed_summary channel={} count={} interval={}", channel, count, warnInterval)
+        }
+    }
+
+    /** One attempt waiting in a lane: the lane sends it, or shutdown or a dead lane gives it up, once. */
+    private inner class SendTask(
+        private val record: OutboundRecord,
+        private val attempt: Int,
+        private val result: CompletableFuture<PublishResult>?,
+        private val previousError: Throwable?,
+    ) : LaneTask {
+        override fun run() = send(record, attempt, result)
+
+        override fun abandon(stage: PublishFailureStage, cause: Throwable?) =
+            failures.fail(stage, record.topic, record.key, attempt - 1, cause ?: previousError, record.payload, result)
     }
 
     /** A scheduled retry. Exactly one of run (the delay passed) and abandon (the channel closed) acts on it. */
@@ -172,7 +278,7 @@ internal class ChannelEventPublisher(
             if (!claim()) return
             try {
                 if (!open.get()) return giveUp()
-                if (!backpressure.admit(lanes.forKey(record.key)) { send(record, attempt + 1, result) }) {
+                if (!backpressure.admit(lanes.forKey(record.key), SendTask(record, attempt + 1, result, previousError = error))) {
                     failures.fail(QUEUE_FULL, record.topic, record.key, attempt, error, record.payload, result, retriable)
                 }
             } catch (e: Throwable) {
@@ -190,6 +296,10 @@ internal class ChannelEventPublisher(
     }
 
     private companion object {
+        private const val DELIVERED = "delivered"
+
+        /** After the producer closed, how long close() waits for in-flight sends to return (they do at once with Kafka). */
+        private val IN_FLIGHT_GRACE_NANOS = TimeUnit.SECONDS.toNanos(1)
         private val logger = LoggerFactory.getLogger(ChannelEventPublisher::class.java)
     }
 }

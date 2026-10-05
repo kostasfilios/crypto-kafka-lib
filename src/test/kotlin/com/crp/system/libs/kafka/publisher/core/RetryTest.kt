@@ -1,5 +1,6 @@
 package com.crp.system.libs.kafka.publisher.core
 
+import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.CHANNEL_UNAVAILABLE
 import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.DELIVERY_FAILED
 import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.INTERNAL
 import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.QUEUE_FULL
@@ -229,12 +230,15 @@ class RetryTest {
             shutdownTimeout = Duration.ofMillis(50),
         )
 
+        val started = System.nanoTime()
         val failure = h.publisher.publishWithResult("t1", "k", event).awaitFailure()
 
         assertThat(failure.stage).isEqualTo(DELIVERY_FAILED)
         assertThat(failure.attempt).isEqualTo(1)
         assertThat(h.scheduler.awaitScheduled().isCancelled).isTrue()
         assertThat(h.handler.failures).hasSize(1)
+        // close() ran on the lane's own thread: it must not wait for itself (shutdown timeout, then the in-flight grace)
+        assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)).isLessThan(800)
     }
 
     @Test
@@ -263,10 +267,15 @@ class RetryTest {
         // the timer fires at once (attempt 2 is queued), then close() runs before retryOrFail's own check
         h.scheduler.onSchedule = { task -> task.runnable.run(); h.publisher.close() }
 
-        val result = h.publisher.publishWithResult("t1", "k", event).awaitResult()
+        val failure = h.publisher.publishWithResult("t1", "k", event).awaitFailure()
 
-        assertThat(result.attempts).isEqualTo(2) // the queued attempt was drained and delivered
-        assertThat(h.handler.failures).isEmpty()
+        // close gave the queued attempt up; the retry the timer already ran is not failed a second time
+        assertThat(Threads.awaitGone("${h.channel}-publisher-")).isEmpty() // the lane finished retryOrFail's own check too
+        assertThat(failure.stage).isEqualTo(CHANNEL_UNAVAILABLE)
+        assertThat(failure.attempt).isEqualTo(1)
+        assertThat(failure.cause).isSameAs(metadataTimeout)
+        assertThat(h.handler.failures).hasSize(1)
+        assertThat(h.sender.calls).hasSize(1)
     }
 
     @Test

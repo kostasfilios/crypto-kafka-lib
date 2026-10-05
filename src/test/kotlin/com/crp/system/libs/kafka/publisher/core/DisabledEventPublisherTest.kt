@@ -21,6 +21,15 @@ class DisabledEventPublisherTest {
     }
 
     @Test
+    fun `null arguments are fine too`() {
+        assertDoesNotThrow { publisher.publish(null, null, null, null) }
+        assertDoesNotThrow { publisher.publishJson(null, null, null, null) }
+        val failure = publisher.publishWithResult(null, null, null, null).awaitFailure()
+        assertThat(failure.stage).isEqualTo(CHANNEL_UNAVAILABLE)
+        assertThat(failure.topic).isEmpty()
+    }
+
+    @Test
     fun `publishWithResult fails at once with CHANNEL_UNAVAILABLE`() {
         val failure = publisher.publishWithResult("t1", "k", SampleEvent("x", "1")).awaitFailure()
         assertThat(failure).isEqualTo(PublishFailure("reporting", "t1", "k", CHANNEL_UNAVAILABLE, 0, false, null, null, clock.instant()))

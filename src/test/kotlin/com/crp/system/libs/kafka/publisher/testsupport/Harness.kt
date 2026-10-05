@@ -20,6 +20,7 @@ import com.crp.system.libs.kafka.publisher.core.FailureDispatcher
 import com.crp.system.libs.kafka.publisher.core.PublishLanes
 import com.crp.system.libs.kafka.publisher.spring.BackpressureMode
 import com.crp.system.libs.kafka.publisher.spring.ChannelSettings
+import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
@@ -40,7 +41,9 @@ internal class Harness(
     extraHandlers: List<PublishFailureHandler> = emptyList(),
     val channel: String = "ch${counter.incrementAndGet()}",
     metricsOverride: PublisherMetrics? = null,
+    nanoTimeOverride: (() -> Long)? = null,
 ) : AutoCloseable {
+    private val nanoTime: () -> Long = nanoTimeOverride ?: clock::nanoTime
     val handler = RecordingFailureHandler()
     val metrics = RecordingMetrics()
     private val effectiveMetrics: PublisherMetrics = metricsOverride ?: metrics
@@ -59,9 +62,11 @@ internal class Harness(
         classifier = classifier,
         retryPolicy = retryPolicy,
         maintenance = scheduler,
-        failures = FailureDispatcher(channel, listOf(handler) + extraHandlers, effectiveMetrics, clock),
+        failures = FailureDispatcher(channel, listOf(handler) + extraHandlers, effectiveMetrics, clock, Duration.ofSeconds(10), nanoTime),
         metrics = effectiveMetrics,
         clock = clock,
+        nanoTime = nanoTime,
+        warnInterval = Duration.ofSeconds(10),
     )
 
     override fun close() = publisher.close()

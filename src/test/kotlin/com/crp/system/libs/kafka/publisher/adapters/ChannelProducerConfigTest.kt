@@ -1,6 +1,8 @@
 package com.crp.system.libs.kafka.publisher.adapters
 
+import ch.qos.logback.classic.Level
 import com.crp.system.libs.kafka.publisher.spring.ProducerSettings
+import com.crp.system.libs.kafka.publisher.testsupport.LogCapture
 import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.common.serialization.ByteArraySerializer
 import org.apache.kafka.common.serialization.StringSerializer
@@ -94,6 +96,23 @@ class ChannelProducerConfigTest {
             entry("max.in.flight.requests.per.connection", "1"),
             entry("client.id", "custom"),
         )
+    }
+
+    @Test
+    fun `extra cannot make the channel transactional, and says so`() {
+        LogCapture(ChannelProducerConfig::class.java).use { logs ->
+            val config = build(ProducerSettings(extra = mapOf("transactional.id" to "tx-from-extra", "linger.ms" to "7")))
+            assertThat(config).doesNotContainKey(ProducerConfig.TRANSACTIONAL_ID_CONFIG).containsEntry("linger.ms", "7")
+            assertThat(logs.lines(Level.WARN)).containsExactly("kafka_publisher_extra_ignored channel=reporting key=transactional.id reason=never_transactional")
+        }
+    }
+
+    @Test
+    fun `no WARN when extra has no transactional id`() {
+        LogCapture(ChannelProducerConfig::class.java).use { logs ->
+            build() // the service's own transactional.id is removed quietly
+            assertThat(logs.events).isEmpty()
+        }
     }
 
     @Test

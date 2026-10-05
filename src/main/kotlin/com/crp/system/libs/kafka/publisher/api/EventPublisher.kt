@@ -5,7 +5,10 @@ import java.util.concurrent.CompletableFuture
 /**
  * The only thing business code calls. One instance per channel (`crypto.kafka.publisher.channels.<name>`).
  *
- * - **Never throws.** Every failure goes to the channel's failure handlers (and to the `publishWithResult` future).
+ * - **Never throws.** Every failure goes to the channel's failure handlers (and to the `publishWithResult` future),
+ *   bad arguments included: a null topic is an INTERNAL failure, a null event or json a SERIALIZATION failure, and a
+ *   header with a null name or value is left out. The parameters are nullable so that no caller (Java, or Kotlin
+ *   holding a value of a Java type) can make the call throw before the publisher sees it.
  * - **Returns at once.** The event is serialized on the caller thread, then queued; the send runs on a lane thread.
  *   Two policies are the bounded exceptions: CALLER_RUNS (a full queue makes the caller send) and
  *   BLOCK_WITH_TIMEOUT (a full queue makes the caller wait up to `block-timeout`).
@@ -15,10 +18,10 @@ interface EventPublisher {
     val channel: String
 
     /** Serializes [event] with the channel's serializer (snake_case Gson by default) and sends it keyed by [key]. */
-    fun publish(topic: String, key: String?, event: Any, headers: Map<String, String> = emptyMap())
+    fun publish(topic: String?, key: String?, event: Any?, headers: Map<String, String?>? = emptyMap())
 
     /** Sends [json] as it is (for topics that keep their own JSON style). */
-    fun publishJson(topic: String, key: String?, json: String, headers: Map<String, String> = emptyMap())
+    fun publishJson(topic: String?, key: String?, json: String?, headers: Map<String, String?>? = emptyMap())
 
     /**
      * Like [publish], and tells the caller the outcome: the future completes with a [PublishResult] on the broker's
@@ -26,10 +29,10 @@ interface EventPublisher {
      * I/O thread: continuations must be quick, or use the `...Async(executor)` variants.
      */
     fun publishWithResult(
-        topic: String,
+        topic: String?,
         key: String?,
-        event: Any,
-        headers: Map<String, String> = emptyMap(),
+        event: Any?,
+        headers: Map<String, String?>? = emptyMap(),
     ): CompletableFuture<PublishResult>
 }
 

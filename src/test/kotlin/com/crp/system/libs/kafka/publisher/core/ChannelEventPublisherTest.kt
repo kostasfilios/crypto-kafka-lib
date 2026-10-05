@@ -11,10 +11,12 @@ import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.SEND_REJECTED
 import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.SERIALIZATION
 import com.crp.system.libs.kafka.publisher.api.PublishResult
 import com.crp.system.libs.kafka.publisher.api.PublisherMetrics
+import ch.qos.logback.classic.Level
 import com.crp.system.libs.kafka.publisher.spring.BackpressureMode
 import com.crp.system.libs.kafka.publisher.spring.ChannelSettings
 import com.crp.system.libs.kafka.publisher.testsupport.FakeRecordSender
 import com.crp.system.libs.kafka.publisher.testsupport.Harness
+import com.crp.system.libs.kafka.publisher.testsupport.LogCapture
 import com.crp.system.libs.kafka.publisher.testsupport.SampleEvent
 import com.crp.system.libs.kafka.publisher.testsupport.awaitFailure
 import com.crp.system.libs.kafka.publisher.testsupport.awaitResult
@@ -70,13 +72,13 @@ class ChannelEventPublisherTest {
     }
 
     @Test
-    fun `the record carries the channel, topic, key, snake_case JSON, headers and the enqueue time`() {
+    fun `the record carries the channel, topic, key, snake_case JSON, headers and the monotonic enqueue time`() {
         val h = harness()
-        val enqueuedAt = h.clock.instant()
+        val enqueuedNanos = h.clock.nanoTime()
         h.publisher.publishWithResult("t1", "42", event, mapOf("source_service" to "AccountServices")).awaitResult()
 
         val record = h.sender.calls.single().record
-        assertThat(record).isEqualTo(OutboundRecord(h.channel, "t1", "42", json, mapOf("source_service" to "AccountServices"), enqueuedAt))
+        assertThat(record).isEqualTo(OutboundRecord(h.channel, "t1", "42", json, mapOf("source_service" to "AccountServices"), enqueuedNanos))
     }
 
     @Test
@@ -100,6 +102,91 @@ class ChannelEventPublisherTest {
         val call = h.sender.nextCall()
         assertThat(call.record.headers).isEqualTo(mapOf("a" to "1"))
         assertThat(call.thread).isEqualTo("${h.channel}-publisher-0")
+    }
+
+    @Test
+    fun `latency is measured on the monotonic clock, so a wall clock stepping back cannot make it negative`() {
+        val sender = FakeRecordSender()
+        val h = harness(sender = sender)
+        sender.script = { _, _, onOutcome ->
+            h.clock.stepWallClock(Duration.ofHours(-1))
+            h.clock.advance(Duration.ofMillis(5))
+            onOutcome(SendOutcome.Delivered(0, 1))
+        }
+        assertThat(h.publisher.publishWithResult("t1", "k", event).awaitResult().latency).isEqualTo(Duration.ofMillis(5))
+    }
+
+    // null arguments (Ruling L-1, C9): reported, never thrown
+
+    @Test
+    fun `a null topic is an INTERNAL failure with a clear message, and nothing is sent`() {
+        val h = harness()
+        val failure = h.publisher.publishWithResult(null, "k", event).awaitFailure()
+        assertThat(failure.stage).isEqualTo(INTERNAL)
+        assertThat(failure.topic).isEmpty()
+        assertThat(failure.cause).isInstanceOf(IllegalArgumentException::class.java).hasMessage("publish called with a null topic")
+        assertDoesNotThrow { h.publisher.publish(null, null, null, null) }
+        assertDoesNotThrow { h.publisher.publishJson(null, null, null, null) }
+        assertThat(h.sender.calls).isEmpty()
+        h.publisher.close()
+        assertThat(h.publisher.publishWithResult(null, "k", event).awaitFailure().stage).isEqualTo(INTERNAL) // closed or not
+    }
+
+    @Test
+    fun `a null event or json is a SERIALIZATION failure`() {
+        val h = harness()
+        h.publisher.publishWithResult("t1", "k", null)
+        h.publisher.publish("t1", "k", null)
+        h.publisher.publishJson("t1", "k", null)
+        assertThat(h.handler.awaitFailures(3).map { it.stage to it.cause?.message }).containsExactly(
+            SERIALIZATION to "publishWithResult called with a null event",
+            SERIALIZATION to "publish called with a null event",
+            SERIALIZATION to "publishJson called with null json",
+        )
+        assertThat(h.sender.calls).isEmpty()
+    }
+
+    @Test
+    fun `null headers send none, and a header with a null name or value is left out`() {
+        val h = harness()
+        h.publisher.publishWithResult("t1", "k", event, null).awaitResult()
+        @Suppress("UNCHECKED_CAST")
+        val javaStyle = hashMapOf<String?, String?>(null to "orphan", "dropped" to null, "kept" to "1") as Map<String, String?>
+        h.publisher.publishWithResult("t1", "k", event, javaStyle).awaitResult()
+        assertThat(h.sender.calls.map { it.record.headers }).containsExactly(emptyMap(), mapOf("kept" to "1"))
+    }
+
+    // warnings about failing metrics are rate-limited (M3)
+
+    @Test
+    fun `flushWarnings also reports the failure handlers' held-back warnings`() {
+        val throwing = PublishFailureHandler { throw IllegalStateException("handler down") }
+        LogCapture(FailureDispatcher::class.java).use { logs ->
+            val h = harness(sender = FakeRecordSender(FakeRecordSender.fail(RecordTooLargeException())), extraHandlers = listOf(throwing))
+            repeat(3) { h.publisher.publishWithResult("t1", "k", event).awaitFailure() }
+            h.publisher.flushWarnings()
+            assertThat(logs.lines(Level.WARN, "kafka_publisher_failure_handler_failed_summary"))
+                .singleElement().asString().startsWith("kafka_publisher_failure_handler_failed_summary channel=${h.channel} handler=").endsWith(" count=2 interval=PT10S")
+        }
+    }
+
+    @Test
+    fun `throwing delivery metrics are warned once per interval, the rest are summarised`() {
+        val metrics = object : PublisherMetrics by PublisherMetrics.None {
+            override fun delivered(channel: String, topic: String, latency: Duration) = throw IllegalStateException("metrics down")
+        }
+        LogCapture(ChannelEventPublisher::class.java).use { logs ->
+            val h = Harness(metricsOverride = metrics).also { harnesses += it }
+            repeat(3) { h.publisher.publishWithResult("t1", "k", event).awaitResult() }
+            assertThat(logs.lines(Level.WARN)).containsExactly("kafka_publisher_metrics_failed channel=${h.channel}: java.lang.IllegalStateException: metrics down")
+
+            h.publisher.flushWarnings()
+            assertThat(logs.lines(Level.WARN).last()).isEqualTo("kafka_publisher_metrics_failed_summary channel=${h.channel} count=2 interval=PT10S")
+
+            h.clock.advance(Duration.ofSeconds(10))
+            h.publisher.publishWithResult("t1", "k", event).awaitResult()
+            assertThat(logs.lines(Level.WARN, "kafka_publisher_metrics_failed channel=")).hasSize(2)
+        }
     }
 
     // ── each stage maps to its failure, once ──────────────────────────────────────────────────────────

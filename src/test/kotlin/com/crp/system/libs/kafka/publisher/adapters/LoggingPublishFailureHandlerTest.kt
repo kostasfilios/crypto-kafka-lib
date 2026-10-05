@@ -15,17 +15,14 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.time.Duration
-import java.time.Clock
 import java.time.Instant
-import java.time.ZoneId
-import java.time.ZoneOffset
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class LoggingPublishFailureHandlerTest {
     private val clock = MutableClock(Instant.parse("2026-10-05T12:00:00Z"))
-    private val handler = LoggingPublishFailureHandler(Duration.ofSeconds(10), clock)
+    private val handler = LoggingPublishFailureHandler(Duration.ofSeconds(10), clock::nanoTime)
     private val logs = LogCapture(LoggingPublishFailureHandler::class.java)
     private val secret = """{"player_id":"42","email":"player@example.com","note":"PAYLOAD-SECRET"}"""
 
@@ -90,8 +87,8 @@ class LoggingPublishFailureHandlerTest {
         assertThat(errors()).hasSize(2)
     }
 
-    /** Releases [parties] threads from `millis()` at the same instant (spinning, not parking), so they race into the CAS. */
-    private class RacingClock(private val parties: Int) : Clock() {
+    /** A monotonic source that releases [parties] threads at the same instant (spinning, not parking), so they race into the CAS. */
+    private class RacingNanos(private val parties: Int) {
         @Volatile var now: Long = 0
         @Volatile private var armed = false
         @Volatile private var go = false
@@ -107,7 +104,7 @@ class LoggingPublishFailureHandlerTest {
             armed = false
         }
 
-        override fun millis(): Long {
+        fun read(): Long {
             if (armed) {
                 if (arrived.incrementAndGet() == parties) go = true
                 val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
@@ -115,25 +112,21 @@ class LoggingPublishFailureHandlerTest {
             }
             return now
         }
-
-        override fun instant(): Instant = Instant.ofEpochMilli(now)
-        override fun getZone(): ZoneId = ZoneOffset.UTC
-        override fun withZone(zone: ZoneId?): Clock = this
     }
 
     @Test
     fun `threads racing for the same due log line log it exactly once and count the rest`() {
         val parties = 4
         val rounds = 200
-        val clock = RacingClock(parties)
-        val racing = LoggingPublishFailureHandler(Duration.ofSeconds(10), clock)
+        val clock = RacingNanos(parties)
+        val racing = LoggingPublishFailureHandler(Duration.ofSeconds(10), clock::read)
         val pool = Executors.newFixedThreadPool(parties)
         try {
             repeat(rounds) { round ->
                 val topic = "race-$round"
-                clock.now = 1_000_000L
+                clock.now = 1_000_000_000L
                 racing.onFailure(failure(topic = topic)) // logged; the key exists, so the racers take the lock-free path
-                clock.now += 10_000L // the next line for this key is due
+                clock.now += TimeUnit.SECONDS.toNanos(10) // the next line for this key is due
                 clock.arm()
                 (1..parties).map { pool.submit { racing.onFailure(failure(topic = topic)) } }.forEach { it.get(10, TimeUnit.SECONDS) }
                 clock.disarm()
@@ -187,9 +180,26 @@ class LoggingPublishFailureHandlerTest {
     }
 
     @Test
-    fun `works from the epoch clock too (the first failure is always logged)`() {
-        val epochHandler = LoggingPublishFailureHandler(Duration.ofSeconds(10), MutableClock(Instant.EPOCH))
-        epochHandler.onFailure(failure())
+    fun `works from any monotonic origin, across the wrap-around too`() {
+        var nanos = Long.MAX_VALUE - TimeUnit.SECONDS.toNanos(1)
+        val wrapping = LoggingPublishFailureHandler(Duration.ofSeconds(10)) { nanos }
+        wrapping.onFailure(failure()) // the first failure is always logged
+        nanos += TimeUnit.SECONDS.toNanos(5) // wraps to a negative value: 5 s later, still inside the interval
+        wrapping.onFailure(failure())
         assertThat(errors()).hasSize(1)
+        nanos += TimeUnit.SECONDS.toNanos(5) // 10 s after the first line
+        wrapping.onFailure(failure())
+        assertThat(errors()).hasSize(2)
+    }
+
+    @Test
+    fun `a wall clock stepping back neither silences an error nor repeats it`() {
+        handler.onFailure(failure())
+        clock.stepWallClock(Duration.ofHours(-1)) // NTP or a VM resume moves the wall clock; monotonic time goes on
+        handler.onFailure(failure())
+        assertThat(errors()).hasSize(1) // not repeated
+        clock.advance(Duration.ofSeconds(10))
+        handler.onFailure(failure())
+        assertThat(errors()).hasSize(2) // and not silenced for an hour
     }
 }

@@ -21,6 +21,7 @@ import com.crp.system.libs.kafka.publisher.core.FailureDispatcher
 import com.crp.system.libs.kafka.publisher.core.PublishLanes
 import com.crp.system.libs.kafka.publisher.core.RecordSender
 import com.crp.system.libs.kafka.publisher.core.TopicInspector
+import com.crp.system.libs.kafka.publisher.core.saturatedNanos
 import org.apache.kafka.clients.producer.KafkaProducer
 import org.apache.kafka.clients.producer.ProducerConfig
 import org.slf4j.LoggerFactory
@@ -56,23 +57,35 @@ internal class ConfiguredEventPublisherChannels private constructor(
 
     override fun names(): Set<String> = publishers.keys
 
-    /** Closes each channel (drain, then producer close), stops the maintenance thread and flushes the summaries once more. */
+    /**
+     * Every channel stops accepting at once, then all drain against one shared deadline (the longest shutdown timeout,
+     * so shutdown takes the longest timeout, not the sum); each closes its producer and fails what is still queued.
+     * Then the maintenance thread stops and the summaries are flushed once more.
+     */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
-        for (channel in active) {
-            try {
-                channel.close()
-            } catch (e: Throwable) {
-                logger.warn("kafka_publisher_channel_close_failed channel={}: {}", channel.channel, e.toString())
-            }
-        }
+        val start = System.nanoTime()
+        val closing = active.filter { channel -> guarded(channel.channel) { channel.beginClose() } ?: false }
+        val deadline = start + (closing.maxOfOrNull { it.shutdownTimeout.saturatedNanos() } ?: 0L).coerceAtLeast(0)
+        for (channel in closing) guarded(channel.channel) { channel.finishClose(deadline) }
         maintenance?.let { stopMaintenance(it) }
-        logging.flushSummaries()
+        flushSummaries(logging, active)
     }
+
+    private inline fun <T> guarded(channel: String, block: () -> T): T? =
+        try {
+            block()
+        } catch (e: Throwable) {
+            logger.warn("kafka_publisher_channel_close_failed channel={}: {}", channel, e.toString())
+            null
+        }
 
     companion object {
         const val MAINTENANCE_THREAD = "kafka-publisher-maintenance"
         val DEFAULT_SUMMARY_INTERVAL: Duration = Duration.ofSeconds(10)
+        const val MAX_LANES = 16
+        const val MAX_QUEUE_CAPACITY = 1_000_000
+        const val MAX_LANE_CAPACITY = 250_000
         private val TOPIC_CHECK_TIMEOUT: Duration = Duration.ofSeconds(5)
         private val logger = LoggerFactory.getLogger(ConfiguredEventPublisherChannels::class.java)
 
@@ -87,13 +100,15 @@ internal class ConfiguredEventPublisherChannels private constructor(
             topicInspectorFactory: (Map<String, Any>) -> TopicInspector = { config -> AdminClientTopicInspector(config) },
             /** Channels whose property values did not convert, with the reason (from the strict re-bind). */
             bindingErrors: Map<String, String> = emptyMap(),
+            /** Monotonic time for rate limits, latency and cool-downs. */
+            nanoTime: () -> Long = System::nanoTime,
         ): ConfiguredEventPublisherChannels {
             val summaryInterval = validSummaryInterval(properties.summaryInterval)
-            val logging = LoggingPublishFailureHandler(summaryInterval, clock)
+            val logging = LoggingPublishFailureHandler(summaryInterval, nanoTime)
             val handlers = listOf<PublishFailureHandler>(logging) + extraFailureHandlers
             val publishers = LinkedHashMap<String, EventPublisher>()
             val active = ArrayList<ChannelEventPublisher>()
-            var maintenance: ScheduledExecutorService? = null
+            var maintenance: ScheduledExecutorService? = null // no thread until it gets work, and only for enabled channels
 
             for ((name, settings) in properties.channels) {
                 publishers[name] = DisabledEventPublisher(name, clock)
@@ -115,10 +130,18 @@ internal class ConfiguredEventPublisherChannels private constructor(
                     logger.error("kafka_publisher_channel_invalid channel={} reason={}", name, invalid)
                     continue
                 }
-                val producerConfig = ChannelProducerConfig.build(sharedProducerConfig, name, settings.producer, applicationName)
+                val producerConfig: Map<String, Any>
+                val inspector: TopicInspector?
+                try { // nothing has started yet
+                    producerConfig = ChannelProducerConfig.build(sharedProducerConfig, name, settings.producer, applicationName)
+                    inspector = if (settings.topics.isEmpty()) null else topicInspectorFactory(producerConfig)
+                } catch (e: Throwable) {
+                    logger.error("kafka_publisher_channel_invalid channel={} reason=startup cause={}", name, causeOf(e))
+                    continue
+                }
                 val sender = try {
                     senderFactory(producerConfig)
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     logger.error("kafka_publisher_channel_invalid channel={} reason=producer_config cause={}", name, causeOf(e))
                     continue
                 }
@@ -136,21 +159,25 @@ internal class ConfiguredEventPublisherChannels private constructor(
                         classifier = KafkaRetriableClassifier,
                         retryPolicy = ExponentialRetryPolicy(settings.retry),
                         maintenance = executor,
-                        failures = FailureDispatcher(name, handlers, metrics, clock),
+                        failures = FailureDispatcher(name, handlers, metrics, clock, summaryInterval, nanoTime),
                         metrics = metrics,
                         clock = clock,
+                        nanoTime = nanoTime,
+                        warnInterval = summaryInterval,
                     )
                     built = channel
                     publishers[name] = channel
                     active += channel
                     registerQueueDepth(metrics, name, lanes)
-                    if (settings.topics.isNotEmpty()) checkTopics(executor, name, settings.topics, topicInspectorFactory(producerConfig))
+                    if (inspector != null) checkTopics(executor, name, settings.topics, inspector)
                     logger.info(
-                        "kafka_publisher_channel_enabled channel={} client_id={} lanes={} queue_capacity={} backpressure={} ordering={} max_attempts={} max_block_ms={}",
-                        name, producerConfig[ProducerConfig.CLIENT_ID_CONFIG], settings.lanes, settings.queueCapacity, settings.backpressure,
-                        settings.ordering, settings.retry.maxAttempts, producerConfig[ProducerConfig.MAX_BLOCK_MS_CONFIG],
+                        "kafka_publisher_channel_enabled channel={} client_id={} bootstrap={} lanes={} queue_capacity={} backpressure={} " +
+                            "ordering={} max_attempts={} max_block_ms={} missing_topic_cooldown={}",
+                        name, producerConfig[ProducerConfig.CLIENT_ID_CONFIG], producerConfig[ProducerConfig.BOOTSTRAP_SERVERS_CONFIG],
+                        settings.lanes, settings.queueCapacity, settings.backpressure, settings.ordering, settings.retry.maxAttempts,
+                        producerConfig[ProducerConfig.MAX_BLOCK_MS_CONFIG], settings.producer.missingTopicCooldown,
                     )
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     logger.error("kafka_publisher_channel_invalid channel={} reason=startup cause={}", name, causeOf(e))
                     publishers[name] = DisabledEventPublisher(name, clock)
                     if (built != null) {
@@ -161,28 +188,46 @@ internal class ConfiguredEventPublisherChannels private constructor(
                     }
                 }
             }
-            maintenance?.scheduleWithFixedDelay(
-                { flushQuietly(logging) }, summaryInterval.toMillis(), summaryInterval.toMillis(), TimeUnit.MILLISECONDS,
-            )
+            if (active.isEmpty()) {
+                maintenance?.shutdownNow() // a channel that failed at startup leaves no maintenance thread behind
+                maintenance = null
+            } else {
+                maintenance?.scheduleWithFixedDelay(
+                    { flushSummaries(logging, active) }, summaryInterval.toMillis(), summaryInterval.toMillis(), TimeUnit.MILLISECONDS,
+                )
+            }
             return ConfiguredEventPublisherChannels(publishers, active, maintenance, logging, clock)
         }
 
         /** Null when the settings are usable, otherwise why not. */
         fun invalidReason(settings: ChannelSettings): String? {
+            val retry = settings.retry
             val producer = settings.producer
             return when {
-                settings.lanes !in 1..16 -> "lanes=${settings.lanes} is outside 1-16"
+                settings.lanes !in 1..MAX_LANES -> "lanes=${settings.lanes} is outside 1-$MAX_LANES"
                 settings.queueCapacity < settings.lanes -> "queue-capacity=${settings.queueCapacity} is below lanes=${settings.lanes}"
-                settings.backpressure == BackpressureMode.BLOCK_WITH_TIMEOUT && (settings.blockTimeout.isZero || settings.blockTimeout.isNegative) ->
+                settings.queueCapacity > MAX_QUEUE_CAPACITY -> "queue-capacity=${settings.queueCapacity} is above $MAX_QUEUE_CAPACITY"
+                perLaneCapacity(settings) > MAX_LANE_CAPACITY ->
+                    "queue-capacity=${settings.queueCapacity} gives ${perLaneCapacity(settings)} per lane, above $MAX_LANE_CAPACITY"
+                settings.backpressure == BackpressureMode.BLOCK_WITH_TIMEOUT && !positive(settings.blockTimeout) ->
                     "block-timeout=${settings.blockTimeout} must be > 0 under BLOCK_WITH_TIMEOUT"
-                settings.retry.maxAttempts < 1 -> "retry.max-attempts=${settings.retry.maxAttempts} is below 1"
-                !(settings.retry.multiplier >= 1.0) -> "retry.multiplier=${settings.retry.multiplier} is below 1"
+                retry.maxAttempts < 1 -> "retry.max-attempts=${retry.maxAttempts} is below 1"
+                !(retry.multiplier >= 1.0) -> "retry.multiplier=${retry.multiplier} is below 1"
+                !positive(retry.initialBackoff) -> "retry.initial-backoff=${retry.initialBackoff} must be > 0"
+                !positive(retry.maxBackoff) -> "retry.max-backoff=${retry.maxBackoff} must be > 0"
+                retry.maxBackoff < retry.initialBackoff -> "retry.max-backoff=${retry.maxBackoff} is below retry.initial-backoff=${retry.initialBackoff}"
                 producer.deliveryTimeoutMs.toLong() < producer.lingerMs.toLong() + producer.requestTimeoutMs ->
                     "producer.delivery-timeout-ms=${producer.deliveryTimeoutMs} is below linger-ms + request-timeout-ms " +
                         "(${producer.lingerMs} + ${producer.requestTimeoutMs})"
+                producer.missingTopicCooldown.isNegative -> "producer.missing-topic-cooldown=${producer.missingTopicCooldown} is negative (0 turns it off)"
                 else -> null
             }
         }
+
+        /** What each lane's queue gets (the split rounds up). Only meaningful once lanes is in range. */
+        private fun perLaneCapacity(settings: ChannelSettings): Int = (settings.queueCapacity + settings.lanes - 1) / settings.lanes
+
+        private fun positive(duration: Duration): Boolean = !duration.isZero && !duration.isNegative
 
         private fun backpressureFor(settings: ChannelSettings): BackpressurePolicy = when (settings.backpressure) {
             BackpressureMode.DROP -> DropWhenFull
@@ -191,7 +236,7 @@ internal class ConfiguredEventPublisherChannels private constructor(
         }
 
         private fun validSummaryInterval(interval: Duration): Duration {
-            if (!interval.isZero && !interval.isNegative) return interval
+            if (positive(interval)) return interval
             logger.error("kafka_publisher_invalid_setting summary-interval={} reason=not_positive using={}", interval, DEFAULT_SUMMARY_INTERVAL)
             return DEFAULT_SUMMARY_INTERVAL
         }
@@ -233,15 +278,20 @@ internal class ConfiguredEventPublisherChannels private constructor(
             }
         }
 
-        private fun flushQuietly(logging: LoggingPublishFailureHandler) {
+        /** The failure summaries, then the WARNs each channel held back (failing handlers, failing metrics). */
+        private fun flushSummaries(logging: LoggingPublishFailureHandler, channels: List<ChannelEventPublisher>) {
             try {
                 logging.flushSummaries()
+                channels.forEach { it.flushWarnings() }
             } catch (e: Throwable) {
                 logger.warn("kafka_publisher_summary_failed: {}", e.toString())
             }
         }
 
+        /** The first five links of the cause chain; never throws, even for an exception whose message does. */
         private fun causeOf(error: Throwable): String =
-            generateSequence(error) { it.cause }.take(5).joinToString(" <- ") { "${it.javaClass.simpleName}: ${it.message}" }
+            generateSequence(error) { it.cause }.take(5).joinToString(" <- ") { link ->
+                "${link.javaClass.simpleName}: ${runCatching { link.message }.getOrNull()}"
+            }
     }
 }
