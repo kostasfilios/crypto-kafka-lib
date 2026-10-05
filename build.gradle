@@ -10,7 +10,7 @@ plugins {
 }
 
 group = 'com.crp.libs'
-version = '1.0.0'
+version = '1.3.0'
 
 java {
     sourceCompatibility = '17'
@@ -22,7 +22,9 @@ repositories {
 
 dependencyManagement {
     imports {
-        mavenBom org.springframework.boot.gradle.plugin.SpringBootPlugin.BOM_COORDINATES
+        // The oldest Boot line the services run (3.1-3.3): compiling against it keeps the lib off newer
+        // spring-kafka (3.0) and kafka-clients (3.4) APIs.
+        mavenBom 'org.springframework.boot:spring-boot-dependencies:3.1.5'
     }
 }
 
@@ -38,9 +40,20 @@ dependencies {
     // Kotlin
     implementation 'org.jetbrains.kotlin:kotlin-reflect'
     implementation 'org.jetbrains.kotlin:kotlin-stdlib-jdk8'
+
+    // JSON for the event publisher's default serializer (the version the services use)
+    implementation 'com.google.code.gson:gson:2.8.9'
+
+    // Metrics: only used when the service has Micrometer and a MeterRegistry bean
+    compileOnly 'io.micrometer:micrometer-core'
     
     // Annotations
     compileOnly 'jakarta.annotation:jakarta.annotation-api:2.1.1'
+
+    // Tests
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-actuator'
+    testImplementation 'io.micrometer:micrometer-core'
 }
 
 tasks.withType(KotlinCompile) {
@@ -48,6 +61,34 @@ tasks.withType(KotlinCompile) {
         freeCompilerArgs += '-Xjsr305=strict'
         jvmTarget = '17'
     }
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    testLogging {
+        events 'failed', 'skipped'
+        exceptionFormat 'full'
+    }
+}
+
+tasks.named('test') {
+    exclude '**/nomicrometer/**'
+}
+
+// The lib must load and work in a service without Micrometer: run that test with micrometer-core
+// (and the actuator, which brings it) removed from the classpath.
+def testWithoutMicrometer = tasks.register('testWithoutMicrometer', Test) {
+    description = 'Runs the no-Micrometer tests with micrometer-core and the actuator removed from the classpath.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath.filter { file ->
+        !['micrometer-core', 'micrometer-jakarta9', 'spring-boot-actuator', 'HdrHistogram', 'LatencyUtils'].any { file.name.startsWith(it) }
+    }
+    include '**/nomicrometer/**'
+}
+
+tasks.named('check') {
+    dependsOn testWithoutMicrometer
 }
 
 // JitPack publication
