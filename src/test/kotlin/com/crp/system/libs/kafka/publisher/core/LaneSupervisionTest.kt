@@ -108,15 +108,21 @@ class LaneSupervisionTest {
             lane.tryEnqueue { gated.countDown(); gate.await(5, TimeUnit.SECONDS) }
             assertThat(gated.await(5, TimeUnit.SECONDS)).isTrue()
             lane.tryEnqueue(poison()) // the first worker dies after the gate
+            val replacementBusy = CountDownLatch(1)
+            val releaseReplacement = CountDownLatch(1)
             val drainedByReplacement = AtomicBoolean(false)
-            lane.tryEnqueue { drainedByReplacement.set(true) } // runs on the restarted worker
+            lane.tryEnqueue { replacementBusy.countDown(); releaseReplacement.await(10, TimeUnit.SECONDS); drainedByReplacement.set(true) }
             lane.stopAccepting()
             val waiting = Thread { lane.awaitDrained(System.nanoTime() + TimeUnit.SECONDS.toNanos(10)) }.apply { start() }
             eventually { waiting.state == Thread.State.TIMED_WAITING } // joining the first worker
 
             gate.countDown()
-            waiting.join(10_000)
+            assertThat(replacementBusy.await(5, TimeUnit.SECONDS)).isTrue() // the first worker died; its replacement works
+            waiting.join(200)
+            assertThat(waiting.isAlive).describedAs("still waiting for the restarted worker").isTrue()
 
+            releaseReplacement.countDown()
+            waiting.join(10_000)
             assertThat(waiting.isAlive).isFalse()
             assertThat(drainedByReplacement.get()).isTrue() // it returned only after the replacement drained the queue
             assertThat(Thread.getAllStackTraces().keys.filter { it.name == "follow-publisher-0" && it.isAlive }).isEmpty()

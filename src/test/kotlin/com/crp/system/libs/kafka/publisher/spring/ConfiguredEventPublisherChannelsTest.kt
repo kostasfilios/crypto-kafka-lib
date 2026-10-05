@@ -477,14 +477,19 @@ class ConfiguredEventPublisherChannelsTest {
         val checkedOn = CopyOnWriteArrayList<Thread>()
         val checked = CountDownLatch(2)
         val before = publisherThreads()
-        val channels = create(
-            linkedMapOf(
-                "reporting" to ChannelSettings(enabled = true, topics = listOf("t1")),
-                "audit" to ChannelSettings(enabled = true, topics = listOf("t2")),
-            ),
-            sender = { FakeRecordSender() },
-            inspector = { TopicInspector { _, _ -> checkedOn += Thread.currentThread(); checked.countDown(); emptySet() } },
-        )
+        // built from a non-daemon thread, so the maintenance thread is a daemon only because the catalog makes it one
+        var built: ConfiguredEventPublisherChannels? = null
+        Thread {
+            built = create(
+                linkedMapOf(
+                    "reporting" to ChannelSettings(enabled = true, topics = listOf("t1")),
+                    "audit" to ChannelSettings(enabled = true, topics = listOf("t2")),
+                ),
+                sender = { FakeRecordSender() },
+                inspector = { TopicInspector { _, _ -> checkedOn += Thread.currentThread(); checked.countDown(); emptySet() } },
+            )
+        }.apply { isDaemon = false; start(); join(5_000) }
+        val channels = built!!
         assertThat(checked.await(5, TimeUnit.SECONDS)).isTrue()
 
         val maintenance = (publisherThreads() - before).filter { it.name == ConfiguredEventPublisherChannels.MAINTENANCE_THREAD }
@@ -522,9 +527,15 @@ class ConfiguredEventPublisherChannelsTest {
 
     @Test
     fun `close keeps the closing thread's interrupt status`() {
-        val channels = create(mapOf("reporting" to ChannelSettings(enabled = true, topics = listOf("t1"))), sender = { FakeRecordSender() })
+        val checking = CountDownLatch(1)
+        val channels = create(
+            mapOf("reporting" to ChannelSettings(enabled = true, topics = listOf("t1"))),
+            sender = { FakeRecordSender() },
+            inspector = { TopicInspector { _, _ -> checking.countDown(); CountDownLatch(1).await(); emptySet() } }, // keeps maintenance busy
+        )
+        assertThat(checking.await(5, TimeUnit.SECONDS)).isTrue()
         Thread.currentThread().interrupt()
-        channels.close()
+        channels.close() // the wait for the maintenance thread is interrupted at once
         assertThat(Thread.interrupted()).isTrue()
     }
 
@@ -591,8 +602,11 @@ class ConfiguredEventPublisherChannelsTest {
     @Test
     fun `a channel without topics never runs a topic check`() {
         val channels = create(mapOf("reporting" to ChannelSettings(enabled = true)))
-        channels.close() // the maintenance thread has run everything it was given
+        val executor = ConfiguredEventPublisherChannels::class.java.getDeclaredField("maintenance").apply { isAccessible = true }
+            .get(channels) as ScheduledThreadPoolExecutor
+        assertThat(executor.taskCount).isEqualTo(1) // the periodic summary only
         assertThat(inspectorsCreated.get()).isZero()
+        channels.close()
         assertThat(logs.lines(Level.WARN, "kafka_publisher_topic_check_failed")).isEmpty()
     }
 
