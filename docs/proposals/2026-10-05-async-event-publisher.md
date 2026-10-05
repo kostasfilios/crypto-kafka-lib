@@ -567,6 +567,33 @@ class LoggingPublishFailureHandler(private val summaryInterval: Duration, privat
 
 A must-deliver outbox would be another `EventPublisher` implementation behind the same port.
 
+#### Addendum (fix round 1, Ruling L-3): a per-topic cool-down for missing topics
+
+**Problem.** One missing topic stalls the whole channel: every send to it blocks its lane for `max-block-ms` (2 s), and a lane carries all of the channel's topics.
+
+- **Trigger.** The producer reports a `TimeoutException` that is not a `BufferExhaustedException`, through the callback invoked synchronously inside `send()`. That is the metadata-wait case.
+  - `KafkaRecordSender` detects it: the same thread, while still inside `send()`.
+  - It flags the outcome `SendOutcome.Failed(error, topicMissing = true)`.
+  - It never matches on message text.
+- **Effect.** The topic cools down for `crypto.kafka.publisher.channels.<name>.producer.missing-topic-cooldown`.
+  - Default 30s; `0` turns it off; negative is invalid.
+  - During the cool-down, sends to that topic fail at once, without calling `producer.send`.
+  - The failure is DELIVERY_FAILED with cause `TopicCoolingDownException(topic, until)`, `retriable=false`. `attempt` = the attempts made so far.
+  - One WARN `kafka_publisher_topic_cooling_down channel= topic= for=` marks the start.
+- **Recovery.** The first send after the cool-down probes again. Only one sender per channel probes; the others keep failing fast until the probe reports.
+  - A probe that finds the topic ends the cool-down.
+  - A probe that times out again starts a new one.
+- **Implementation.** A `ConcurrentHashMap` of topic → monotonic (`nanoTime`) deadline in `ChannelEventPublisher`. An expired entry is replaced by the probe's deadline, and removed when the probe succeeds.
+- **Not triggered by:**
+  - a full buffer (`BufferExhaustedException`);
+  - a delivery timeout reported later on the producer's I/O thread (`Expiring … record(s)`);
+  - any other error.
+- **Note.** A topic the producer has never seen looks the same while the broker itself is unreachable at startup, so the same cool-down applies then.
+
+| Stage | Raised on | Classified | Then |
+|---|---|---|---|
+| `DELIVERY_FAILED` (cooling down) | lane, before any send | final (`TopicCoolingDownException` is not retriable) | handlers |
+
 ### Wiring: properties, catalog, auto-configuration
 
 ```properties
