@@ -121,14 +121,14 @@ internal class ChannelEventPublisher(
             retriable = classifier.isRetriable(error)
             delay = if (retriable && open.get()) retryPolicy.delayBeforeAttempt(attempt + 1) else null
         } catch (e: Throwable) {
-            if (e !== error) e.addSuppressed(error)
+            e.addSuppressed(error) // Kotlin's addSuppressed ignores an exception suppressing itself
             return failures.fail(INTERNAL, record.topic, record.key, attempt, e, record.payload, result)
         }
         if (delay != null) {
             val retry = PendingRetry(stage, record, attempt, error, retriable, result)
             pendingRetries.add(retry)
             try {
-                retry.scheduled = maintenance.schedule(retry, delay.toMillis(), TimeUnit.MILLISECONDS)
+                retry.track(maintenance.schedule(retry, delay.toMillis(), TimeUnit.MILLISECONDS))
             } catch (shuttingDown: RejectedExecutionException) {
                 if (retry.claim()) retry.giveUp() // report the original failure
                 return
@@ -158,9 +158,14 @@ internal class ChannelEventPublisher(
         private val result: CompletableFuture<PublishResult>?,
     ) : Runnable {
         private val claimed = AtomicBoolean(false)
-        @Volatile var scheduled: ScheduledFuture<*>? = null
+        @Volatile private var scheduled: ScheduledFuture<*>? = null
 
-        fun claim(): Boolean = claimed.compareAndSet(false, true).also { won -> if (won) pendingRetries.remove(this) }
+        fun track(timer: ScheduledFuture<*>) {
+            scheduled = timer
+        }
+
+        /** True for the one caller that may act on this retry. Either way it is no longer pending. */
+        fun claim(): Boolean = claimed.compareAndSet(false, true).also { pendingRetries.remove(this) }
 
         /** Maintenance thread: back through the backpressure policy, at the lane's tail. */
         override fun run() {
