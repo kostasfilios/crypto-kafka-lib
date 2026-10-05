@@ -528,15 +528,19 @@ class ConfiguredEventPublisherChannelsTest {
     @Test
     fun `close keeps the closing thread's interrupt status`() {
         val checking = CountDownLatch(1)
+        val before = publisherThreads()
         val channels = create(
             mapOf("reporting" to ChannelSettings(enabled = true, topics = listOf("t1"))),
             sender = { FakeRecordSender() },
             inspector = { TopicInspector { _, _ -> checking.countDown(); CountDownLatch(1).await(); emptySet() } }, // keeps maintenance busy
         )
         assertThat(checking.await(5, TimeUnit.SECONDS)).isTrue()
+        val maintenance = (publisherThreads() - before).single { it.name == ConfiguredEventPublisherChannels.MAINTENANCE_THREAD }
         Thread.currentThread().interrupt()
         channels.close() // the wait for the maintenance thread is interrupted at once
         assertThat(Thread.interrupted()).isTrue()
+        maintenance.join(5_000) // its interrupted check logs before this test ends, not into the next one
+        assertThat(maintenance.isAlive).isFalse()
     }
 
     @Test
