@@ -1,0 +1,14 @@
+// Gradle init script for tools/mutation/run-pitest.sh: prints the external jars of the root project's test runtime
+// classpath (the project's own classes are mutated from a snapshot instead). Not used by the build itself.
+rootProject {
+    plugins.withId('java') {
+        tasks.register('printTestClasspath') {
+            dependsOn 'testClasses'
+            doLast {
+                def own = project.layout.buildDirectory.get().asFile.absolutePath
+                def jars = sourceSets.test.runtimeClasspath.files.findAll { it.exists() && !it.absolutePath.startsWith(own) }
+                println 'TESTCP=' + jars.collect { it.absolutePath }.join(File.pathSeparator)
+            }
+        }
+    }
+}
