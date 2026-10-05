@@ -30,6 +30,7 @@ import org.springframework.boot.context.annotation.ImportCandidates
 import org.springframework.boot.test.context.runner.ApplicationContextRunner
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.context.annotation.Primary
 import org.springframework.kafka.core.DefaultKafkaProducerFactory
 import org.springframework.kafka.core.KafkaTemplate
 import org.springframework.kafka.core.ProducerFactory
@@ -188,6 +189,21 @@ class EventPublisherAutoConfigurationTest {
     }
 
     @Test
+    fun `with a second @Primary KafkaTemplate, the KYCService shape, the channels build from the primary one`() {
+        LogCapture(ConfiguredEventPublisherChannels::class.java).use { logs ->
+            service.withUserConfiguration(PrimaryTemplate::class.java).withPropertyValues(reportingOn).run { context ->
+                assertThat(context).hasNotFailed()
+                assertThat(context.getBeansOfType(KafkaTemplate::class.java)).hasSize(2)
+                assertThat(channels(context).get("reporting")).isInstanceOf(ChannelEventPublisher::class.java)
+            }
+            assertThat(logs.lines(Level.INFO)).anyMatch {
+                it.startsWith("kafka_publisher_channel_enabled channel=reporting client_id=ctx-test-reporting bootstrap=127.0.0.1:2 ")
+            }
+            assertThat(logs.lines(Level.ERROR)).isEmpty()
+        }
+    }
+
+    @Test
     fun `a ProducerFactory that cannot share its settings switches the channels off, and the context still starts`() {
         runner.withUserConfiguration(OpaqueProducerFactory::class.java).withPropertyValues(reportingOn).run { context ->
             assertThat(context).hasNotFailed()
@@ -299,6 +315,21 @@ class EventPublisherAutoConfigurationTest {
 
         @Bean
         fun secondTemplate(): KafkaTemplate<String, String> = KafkaTemplate(DefaultKafkaProducerFactory(mapOf<String, Any>("bootstrap.servers" to "127.0.0.1:2")))
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    class PrimaryTemplate {
+        @Bean
+        @Primary
+        fun primaryKafkaTemplate(): KafkaTemplate<String, String> = KafkaTemplate(
+            DefaultKafkaProducerFactory(
+                mapOf<String, Any>(
+                    "bootstrap.servers" to "127.0.0.1:2",
+                    "key.serializer" to StringSerializer::class.java,
+                    "value.serializer" to StringSerializer::class.java,
+                ),
+            ),
+        )
     }
 
     @Configuration(proxyBeanMethods = false)

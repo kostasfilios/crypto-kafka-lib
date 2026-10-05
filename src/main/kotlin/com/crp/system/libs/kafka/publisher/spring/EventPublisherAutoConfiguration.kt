@@ -7,7 +7,7 @@ import com.crp.system.libs.kafka.publisher.api.PublisherMetrics
 import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.ObjectProvider
-import org.springframework.boot.autoconfigure.AutoConfiguration
+import org.springframework.boot.autoconfigure.AutoConfigureAfter
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
@@ -17,6 +17,7 @@ import org.springframework.boot.context.properties.bind.Bindable
 import org.springframework.boot.context.properties.bind.Binder
 import org.springframework.boot.context.properties.source.ConfigurationPropertyName
 import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Import
 import org.springframework.core.env.Environment
 import org.springframework.kafka.core.KafkaTemplate
 import java.time.Clock
@@ -25,10 +26,18 @@ import java.time.Duration
 /**
  * Registers one bean, [EventPublisherChannels], and no Kafka beans (AD9): each enabled channel builds its own
  * producer from the service's one `KafkaTemplate`. Inert until a channel is configured.
+ *
+ * Deliberately carries no `@AutoConfiguration` / `@Configuration` stereotype: it loads only from
+ * `AutoConfiguration.imports`. Several services declare their own `@ComponentScan` over `com.crp.system`, and such a
+ * scan has none of Boot's exclude filters. With a stereotype, that scan would register this class as an ordinary
+ * configuration: its conditions would run before the actuator's registry and before the service's own beans, so
+ * metrics would stay off and `@ConditionalOnMissingBean` would not back off. The Micrometer part is imported
+ * explicitly because member classes of a class without a stereotype are not processed.
  */
-@AutoConfiguration(afterName = ["org.springframework.boot.actuate.autoconfigure.metrics.CompositeMeterRegistryAutoConfiguration"])
+@AutoConfigureAfter(name = ["org.springframework.boot.actuate.autoconfigure.metrics.CompositeMeterRegistryAutoConfiguration"])
 @ConditionalOnClass(KafkaTemplate::class)
 @EnableConfigurationProperties(EventPublisherProperties::class)
+@Import(EventPublisherAutoConfiguration.MicrometerMetricsConfiguration::class)
 class EventPublisherAutoConfiguration {
 
     @Bean(destroyMethod = "close")
@@ -51,12 +60,7 @@ class EventPublisherAutoConfiguration {
 
     /**
      * Micrometer, only when the service has it and a `MeterRegistry` bean; a service's own `PublisherMetrics` bean wins.
-     *
-     * Deliberately not annotated `@Configuration`: the services' `@SpringBootApplication` scan covers
-     * `com.crp.system.libs.kafka`, and a nested `@Configuration` class would be picked up by that scan as a regular
-     * configuration, so its `@ConditionalOnBean(MeterRegistry)` would run before the actuator's registry exists and
-     * the metrics would silently stay off. Without the stereotype it is processed only as a member of this
-     * auto-configuration, after `CompositeMeterRegistryAutoConfiguration`.
+     * No stereotype either (see the class comment): it is processed only through the `@Import` above.
      */
     @ConditionalOnClass(name = ["io.micrometer.core.instrument.MeterRegistry"])
     class MicrometerMetricsConfiguration {
