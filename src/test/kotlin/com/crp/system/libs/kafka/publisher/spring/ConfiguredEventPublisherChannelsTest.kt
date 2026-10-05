@@ -608,7 +608,9 @@ class ConfiguredEventPublisherChannelsTest {
         val channels = create(mapOf("reporting" to ChannelSettings(enabled = true)))
         val executor = ConfiguredEventPublisherChannels::class.java.getDeclaredField("maintenance").apply { isAccessible = true }
             .get(channels) as ScheduledThreadPoolExecutor
-        assertThat(executor.taskCount).isEqualTo(1) // the periodic summary only
+        // once the executor is idle (a new worker counts as busy until it starts), only the periodic summary is there
+        eventually { executor.activeCount == 0 }
+        assertThat(executor.completedTaskCount + executor.queue.size).isEqualTo(1)
         assertThat(inspectorsCreated.get()).isZero()
         channels.close()
         assertThat(logs.lines(Level.WARN, "kafka_publisher_topic_check_failed")).isEmpty()
