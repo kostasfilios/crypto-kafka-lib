@@ -390,11 +390,12 @@ class ConfiguredEventPublisherChannelsTest {
     @Test
     fun `shutdown takes the longest shutdown timeout, not their sum`() {
         val releases = CopyOnWriteArrayList<CountDownLatch>()
-        val entered = CountDownLatch(2)
+        val entered = CountDownLatch(3)
         val channels = create(
-            linkedMapOf(
-                "first" to ChannelSettings(enabled = true, lanes = 1, queueCapacity = 10, shutdownTimeout = Duration.ofMillis(400)),
-                "second" to ChannelSettings(enabled = true, lanes = 1, queueCapacity = 10, shutdownTimeout = Duration.ofMillis(100)),
+            linkedMapOf( // the longest timeout is neither the first nor the last channel's
+                "first" to ChannelSettings(enabled = true, lanes = 1, queueCapacity = 10, shutdownTimeout = Duration.ofMillis(100)),
+                "second" to ChannelSettings(enabled = true, lanes = 1, queueCapacity = 10, shutdownTimeout = Duration.ofMillis(400)),
+                "third" to ChannelSettings(enabled = true, lanes = 1, queueCapacity = 10, shutdownTimeout = Duration.ofMillis(100)),
             ),
             sender = {
                 val release = CountDownLatch(1).also { releases += it }
@@ -402,15 +403,14 @@ class ConfiguredEventPublisherChannelsTest {
             },
         )
         try {
-            channels.get("first").publish("t1", "a", SampleEvent("x", "1"))
-            channels.get("second").publish("t1", "a", SampleEvent("x", "1"))
-            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue() // both lanes are stuck
+            listOf("first", "second", "third").forEach { channels.get(it).publish("t1", "a", SampleEvent("x", "1")) }
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue() // every lane is stuck
 
             val started = System.nanoTime()
             channels.close()
             val tookMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
 
-            assertThat(tookMillis).isBetween(350L, 750L) // one wait for the longest timeout (400 ms), not 400 + 100
+            assertThat(tookMillis).isBetween(350L, 750L) // one wait for the longest timeout (400 ms), not 100 + 400 + 100
         } finally {
             releases.forEach { it.countDown() }
         }
