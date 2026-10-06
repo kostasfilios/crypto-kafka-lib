@@ -163,7 +163,9 @@ long (2 s by default), and a lane carries all of its channel's topics. So the to
   attempts made so far (0 for a first send). One WARN
   `kafka_publisher_topic_cooling_down channel=… topic=… for=…` marks the start. Other topics on the lane are not delayed.
 - **Recovery.** The first send after the cool-down checks the topic again (one send per channel; the others keep
-  failing fast meanwhile). If the topic is back, the cool-down ends; if not, it starts again.
+  failing fast meanwhile). If the topic is back, the cool-down ends; if not, it starts again. A cool-down that is over
+  and that nobody sends to again is dropped at the next `summary-interval` tick, so a topic that is never used again
+  keeps no entry; its next send is then treated like the first one.
 - A topic the producer has never seen looks the same when the broker itself is unreachable at startup, so the same
   cool-down applies then. A delivery timeout reported later (`Expiring … record(s)`) does not start one.
 

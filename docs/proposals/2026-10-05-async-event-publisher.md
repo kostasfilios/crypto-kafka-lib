@@ -584,6 +584,8 @@ A must-deliver outbox would be another `EventPublisher` implementation behind th
   - A probe that finds the topic ends the cool-down.
   - A probe that times out again starts a new one.
 - **Implementation.** A `ConcurrentHashMap` of topic → monotonic (`nanoTime`) deadline in `ChannelEventPublisher`. An expired entry is replaced by the probe's deadline, and removed when the probe succeeds.
+  - The summary tick (`flushSummaries`) also removes an expired entry that no send has revisited, so a topic that is never sent to again keeps no entry. The removal is a compare-and-remove on the deadline that passed, so a probe's later deadline stays and the single-probe election is untouched.
+  - A forgotten topic is treated like a new one: its next send is a plain send, and the cool-down starts again if the topic is still missing.
 - **Not triggered by:**
   - a full buffer (`BufferExhaustedException`);
   - a delivery timeout reported later on the producer's I/O thread (`Expiring … record(s)`);

@@ -278,11 +278,17 @@ internal class ConfiguredEventPublisherChannels private constructor(
             }
         }
 
-        /** The failure summaries, then the WARNs each channel held back (failing handlers, failing metrics). */
+        /**
+         * The periodic tick, every summary interval and once more at close: the failure summaries, then the WARNs each
+         * channel held back (failing handlers, failing metrics), and each channel forgets its cool-downs that are over.
+         */
         private fun flushSummaries(logging: LoggingPublishFailureHandler, channels: List<ChannelEventPublisher>) {
             try {
                 logging.flushSummaries()
-                channels.forEach { it.flushWarnings() }
+                channels.forEach {
+                    it.flushWarnings()
+                    it.expireCooldowns()
+                }
             } catch (e: Throwable) {
                 logger.warn("kafka_publisher_summary_failed: {}", e.toString())
             }

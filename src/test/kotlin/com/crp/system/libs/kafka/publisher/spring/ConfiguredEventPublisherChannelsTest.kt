@@ -64,6 +64,7 @@ class ConfiguredEventPublisherChannelsTest {
         sender: (Map<String, Any>) -> RecordSender = { sendersCreated.incrementAndGet(); fakeSender },
         inspector: (Map<String, Any>) -> TopicInspector = { inspectorsCreated.incrementAndGet(); TopicInspector { _, _ -> emptySet() } },
         bindingErrors: Map<String, String> = emptyMap(),
+        nanoTime: () -> Long = System::nanoTime,
     ) = ConfiguredEventPublisherChannels.create(
         properties = EventPublisherProperties(summaryInterval, channels),
         sharedProducerConfig = sharedConfig,
@@ -74,6 +75,7 @@ class ConfiguredEventPublisherChannelsTest {
         senderFactory = sender,
         topicInspectorFactory = inspector,
         bindingErrors = bindingErrors,
+        nanoTime = nanoTime,
     ).also { opened += it }
 
     // ── what starts and what does not ─────────────────────────────────────────────────────────────────
@@ -348,6 +350,23 @@ class ConfiguredEventPublisherChannelsTest {
         } finally {
             release.countDown()
         }
+    }
+
+    @Test
+    fun `the periodic tick forgets the cool-downs that are over`() {
+        val channels = create(
+            mapOf("reporting" to ChannelSettings(enabled = true, lanes = 1)),
+            summaryInterval = Duration.ofMillis(50),
+            sender = { FakeRecordSender(FakeRecordSender.topicMissing("gone")) },
+            nanoTime = clock::nanoTime,
+        )
+        val reporting = channels.get("reporting") as ChannelEventPublisher
+        reporting.publishWithResult("gone", "k", SampleEvent("x", "1")).awaitFailure() // the topic is missing: it cools down for 30 s
+        assertThat(reporting.coolingDownTopics()).containsExactly("gone")
+
+        clock.advance(Duration.ofSeconds(31)) // the cool-down is over, and nobody sends to the topic again
+
+        eventually { reporting.coolingDownTopics().isEmpty() } // the maintenance thread's next tick drops the entry
     }
 
     @Test

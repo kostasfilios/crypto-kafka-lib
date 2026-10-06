@@ -54,7 +54,10 @@ internal class ChannelEventPublisher(
     /** Records given up as CHANNEL_UNAVAILABLE at shutdown: by close(), or by a lane worker that had just polled one as the lanes halted. */
     private val abandonedAtShutdown = AtomicInteger()
 
-    /** Topic -> monotonic time until which sends to it fail at once: it was missing from the broker's metadata. */
+    /**
+     * Topic -> monotonic time until which sends to it fail at once: it was missing from the broker's metadata. An entry
+     * that is over stays for the next send to the topic (the probe), or goes in [expireCooldowns].
+     */
     private val coolingDown = ConcurrentHashMap<String, Long>()
 
     val shutdownTimeout: Duration get() = settings.shutdownTimeout
@@ -204,6 +207,22 @@ internal class ChannelEventPublisher(
         val until = clock.instant().plusNanos(untilNanos - nanoTime())
         failures.fail(DELIVERY_FAILED, record.topic, record.key, attempt - 1, TopicCoolingDownException(record.topic, until), record.payload, result)
     }
+
+    /**
+     * Run with the failure summaries: forgets the cool-downs that are over, so a topic that is never sent to again does
+     * not keep its entry. An entry is removed only while it still holds the deadline that passed: a send that took the
+     * probe meanwhile has replaced it with a later one, which stays. Once forgotten, a topic is treated like a new one.
+     */
+    fun expireCooldowns() {
+        if (coolingDown.isEmpty()) return
+        val now = nanoTime()
+        for ((topic, until) in coolingDown) {
+            if (now - until >= 0) coolingDown.remove(topic, until)
+        }
+    }
+
+    /** The topics that have a cool-down entry, over or not. Read by tests. */
+    fun coolingDownTopics(): Set<String> = coolingDown.keys.toSet()
 
     // ── shutdown ──────────────────────────────────────────────────────────────────────────────────────────
 

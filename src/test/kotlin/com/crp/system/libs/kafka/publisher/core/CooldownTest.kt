@@ -235,6 +235,59 @@ class CooldownTest {
     }
 
     @Test
+    fun `the periodic sweep forgets a cool-down that is over, and keeps one that is still running`() {
+        val sender = FakeRecordSender { record, index, onOutcome ->
+            val script = if (record.topic.startsWith("missing")) FakeRecordSender.topicMissing(record.topic) else FakeRecordSender.deliver()
+            script(record, index, onOutcome)
+        }
+        val h = harness(sender)
+        h.publisher.publishWithResult("missing-a", "k", event).awaitFailure() // cools down for 30 s
+        h.clock.advance(Duration.ofSeconds(20))
+        h.publisher.publishWithResult("missing-b", "k", event).awaitFailure() // 20 s later, so its cool-down ends 20 s after a's
+        h.clock.advance(Duration.ofSeconds(10)) // a's ends exactly now (30 s), b's has 20 s to go
+        assertThat(h.publisher.coolingDownTopics()).containsExactlyInAnyOrder("missing-a", "missing-b") // nobody has sent to either since
+
+        h.publisher.expireCooldowns()
+
+        assertThat(h.publisher.coolingDownTopics()).containsExactly("missing-b")
+        assertThat(h.publisher.publishWithResult("missing-b", "k", event).awaitFailure().cause).isInstanceOf(TopicCoolingDownException::class.java)
+        assertThat(h.sender.callsFor("missing-b")).isEqualTo(1) // still failing at once
+        h.publisher.publishWithResult("missing-a", "k", event).awaitFailure() // forgotten: sent like a new topic, found missing, cooling down again
+        assertThat(h.sender.callsFor("missing-a")).isEqualTo(2)
+        assertThat(h.publisher.coolingDownTopics()).containsExactlyInAnyOrder("missing-a", "missing-b")
+    }
+
+    @Test
+    fun `the sweep leaves the probe's own entry alone, so the other lanes keep failing fast while it runs`() {
+        val probing = CountDownLatch(1)
+        val releaseProbe = CountDownLatch(1)
+        val h = harness(
+            lanes = 2,
+            sender = missingTopicSender { record, index, onOutcome ->
+                if (index > 0) { probing.countDown(); releaseProbe.await(10, TimeUnit.SECONDS) } // the probe blocks like max-block-ms
+                FakeRecordSender.topicMissing("missing")(record, index, onOutcome)
+            },
+        )
+        val (keyA, keyB) = keysOnDifferentLanes()
+        try {
+            h.publisher.publishWithResult("missing", keyA, event).awaitFailure()
+            h.clock.advance(Duration.ofSeconds(30))
+            val probe = h.publisher.publishWithResult("missing", keyA, event)
+            assertThat(probing.await(5, TimeUnit.SECONDS)).isTrue() // the probe has taken the entry: a deadline 30 s ahead
+
+            h.publisher.expireCooldowns() // the tick comes while the probe is still blocked
+
+            val other = h.publisher.publishWithResult("missing", keyB, event).awaitFailure()
+            assertThat(other.cause).isInstanceOf(TopicCoolingDownException::class.java)
+            assertThat(h.sender.callsFor("missing")).isEqualTo(2) // the first send and the probe: the election still holds
+            releaseProbe.countDown()
+            assertThat(probe.awaitFailure().cause).isInstanceOf(TimeoutException::class.java)
+        } finally {
+            releaseProbe.countDown()
+        }
+    }
+
+    @Test
     fun `starting a cool-down logs one WARN`() {
         LogCapture(ChannelEventPublisher::class.java).use { logs ->
             val h = harness()
