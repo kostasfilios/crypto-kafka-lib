@@ -43,11 +43,11 @@ kafka.consumer.group-id=your-group-id
 - `KafkaMessageProducer` - Send messages to Kafka topics
 - `KafkaProducerConfig` - Producer configuration
 - `KafkaConsumerConfig` - Consumer configuration
-- `EventPublisherChannels` / `EventPublisher` - Async, keyed event publishing per named channel (v1.3.0, below)
+- `EventPublisherChannels` / `EventPublisher` - Async, keyed event publishing per named channel (v1.3.1, below)
 
 ## Event publisher channels
 
-Since v1.3.0 (`com.crp.system.libs.kafka.publisher`). A channel is a named, independently configured publisher with
+Since v1.3.1 (`com.crp.system.libs.kafka.publisher`). A channel is a named, independently configured publisher with
 its own Kafka producer, queue and limits. Business code never blocks on Kafka and never gets an exception from it.
 Nothing changes for a service until it enables a channel; `KafkaMessageProducer` is untouched.
 
