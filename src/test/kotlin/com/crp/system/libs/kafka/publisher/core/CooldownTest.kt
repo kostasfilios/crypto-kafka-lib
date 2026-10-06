@@ -11,6 +11,7 @@ import com.crp.system.libs.kafka.publisher.spring.RetrySettings
 import com.crp.system.libs.kafka.publisher.testsupport.FakeRecordSender
 import com.crp.system.libs.kafka.publisher.testsupport.Harness
 import com.crp.system.libs.kafka.publisher.testsupport.LogCapture
+import com.crp.system.libs.kafka.publisher.testsupport.MutableClock
 import com.crp.system.libs.kafka.publisher.testsupport.SampleEvent
 import com.crp.system.libs.kafka.publisher.testsupport.SendScript
 import com.crp.system.libs.kafka.publisher.testsupport.awaitFailure
@@ -285,6 +286,86 @@ class CooldownTest {
         } finally {
             releaseProbe.countDown()
         }
+    }
+
+    /**
+     * Monotonic time that holds the next read of one thread until [release]. It stops a lane inside cooldownFor, after
+     * its read of the topic's deadline and before its replace of it, which is where two lanes race for the probe.
+     */
+    private class PausedNanos(private val clock: MutableClock) {
+        @Volatile private var thread: String? = null
+        private val reached = CountDownLatch(1)
+        private val released = CountDownLatch(1)
+
+        fun pauseNextReadOn(threadName: String) {
+            thread = threadName
+        }
+
+        fun awaitReached(): Boolean = reached.await(5, TimeUnit.SECONDS)
+
+        fun release() = released.countDown()
+
+        fun read(): Long {
+            if (Thread.currentThread().name == thread) {
+                thread = null
+                reached.countDown()
+                released.await(10, TimeUnit.SECONDS)
+            }
+            return clock.nanoTime()
+        }
+    }
+
+    private fun racingHarness(clock: MutableClock, nanos: PausedNanos, channel: String, sender: FakeRecordSender) = Harness(
+        ChannelSettings(enabled = true, lanes = 2, queueCapacity = 64, producer = ProducerSettings(missingTopicCooldown = Duration.ofSeconds(30))),
+        sender,
+        clock = clock,
+        nanoTimeOverride = nanos::read,
+        channel = channel,
+    ).also { harnesses += it }
+
+    @Test
+    fun `a send that loses the probe to a send that found the topic back sends normally`() {
+        val clock = MutableClock()
+        val nanos = PausedNanos(clock)
+        val created = AtomicBoolean(false)
+        val h = racingHarness(clock, nanos, "lost-to-success", missingTopicSender { record, index, onOutcome ->
+            if (created.get()) FakeRecordSender.deliver()(record, index, onOutcome) else FakeRecordSender.topicMissing("missing")(record, index, onOutcome)
+        })
+        val (keyA, keyB) = keysOnDifferentLanes()
+        h.publisher.publishWithResult("missing", keyA, event).awaitFailure() // the topic cools down
+        clock.advance(Duration.ofSeconds(30)) // and the cool-down is over
+        created.set(true) // someone created the topic
+        nanos.pauseNextReadOn(h.lanes.forKey(keyA).name)
+
+        val loser = h.publisher.publishWithResult("missing", keyA, event) // its lane has read the expired deadline, and waits
+        assertThat(nanos.awaitReached()).isTrue()
+        h.publisher.publishWithResult("missing", keyB, event).awaitResult() // the other lane probes and finds the topic back...
+        eventually { h.publisher.coolingDownTopics().isEmpty() } // ...and drops the entry once its send returns, just after the future
+        nanos.release()
+
+        loser.awaitResult() // its replace finds no entry: nothing cools down, it sends like any other send
+        assertThat(h.sender.callsFor("missing")).isEqualTo(3)
+        assertThat(h.publisher.coolingDownTopics()).isEmpty()
+    }
+
+    @Test
+    fun `a send that loses the probe to one whose new cool-down is already over sends normally`() {
+        val clock = MutableClock()
+        val nanos = PausedNanos(clock)
+        val h = racingHarness(clock, nanos, "lost-to-expired", missingTopicSender())
+        val (keyA, keyB) = keysOnDifferentLanes()
+        h.publisher.publishWithResult("missing", keyA, event).awaitFailure() // the topic cools down
+        clock.advance(Duration.ofSeconds(30)) // and the cool-down is over
+        nanos.pauseNextReadOn(h.lanes.forKey(keyA).name)
+
+        val loser = h.publisher.publishWithResult("missing", keyA, event) // its lane has read the expired deadline, and waits
+        assertThat(nanos.awaitReached()).isTrue()
+        assertThat(h.publisher.publishWithResult("missing", keyB, event).awaitFailure().cause).isInstanceOf(TimeoutException::class.java) // the other lane's probe: still missing
+        clock.advance(Duration.ofSeconds(30)) // the cool-down that probe started is over as well when the first lane goes on
+        nanos.release()
+
+        assertThat(loser.awaitFailure().cause).isInstanceOf(TimeoutException::class.java) // it was sent, not failed at once
+        assertThat(h.sender.callsFor("missing")).isEqualTo(3)
     }
 
     @Test
