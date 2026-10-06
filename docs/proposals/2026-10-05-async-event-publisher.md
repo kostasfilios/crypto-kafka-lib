@@ -619,6 +619,17 @@ crypto.kafka.publisher.channels.reporting.shutdown-timeout=5s
 # crypto.kafka.publisher.channels.balance-updates.backpressure=CALLER_RUNS
 ```
 
+> **Implementation note (fix round 1, finding I1): the class below is not the shape that shipped.** It puts `@AutoConfiguration`
+> on the class and a nested `@Configuration` on the Micrometer part. The shipped
+> [`EventPublisherAutoConfiguration.kt`](../../src/main/kotlin/com/crp/system/libs/kafka/publisher/spring/EventPublisherAutoConfiguration.kt)
+> uses `@AutoConfigureAfter(name = [...])`, carries no stereotype (neither `@AutoConfiguration` nor `@Configuration`), and
+> pulls the Micrometer part in with `@Import(EventPublisherAutoConfiguration.MicrometerMetricsConfiguration::class)`.
+> I1 proved the snippet's shape broken under an explicit `@ComponentScan` over `com.crp.system`: such a scan has none of
+> Boot's auto-configuration exclude filters, so it registers the class as an ordinary configuration, whose conditions run
+> before the actuator's registry and the service's own beans. Metrics then stay off and `@ConditionalOnMissingBean` does
+> not back off. `ExplicitComponentScanContextTest` pins the shipped behaviour under such a scan. Read the snippet for
+> the bean wiring only, and the shipped class for the annotations.
+
 ```kotlin
 @AutoConfiguration(afterName = ["org.springframework.boot.actuate.autoconfigure.metrics.CompositeMeterRegistryAutoConfiguration"])
 @ConditionalOnClass(KafkaTemplate::class)
@@ -652,7 +663,7 @@ class EventPublisherAutoConfiguration {
 }
 ```
 
-The `AutoConfiguration.imports` file lists `EventPublisherAutoConfiguration`. Because `@SpringBootApplication`'s scan skips auto-configurations, it is registered once even in services whose scan covers `com.crp.system.libs.kafka`.
+The `AutoConfiguration.imports` file lists `EventPublisherAutoConfiguration`. `@SpringBootApplication`'s own scan skips auto-configurations, but a service's explicit `@ComponentScan` does not (see the implementation note above). The shipped class therefore has no stereotype and loads only from that file, so it is registered once, even in services whose scan covers `com.crp.system.libs.kafka`.
 
 `ConfiguredEventPublisherChannels.create` decides each channel as follows:
 

@@ -161,7 +161,8 @@ long (2 s by default), and a lane carries all of its channel's topics. So the to
 - **Effect.** For `producer.missing-topic-cooldown` (default 30 s), sends to that topic fail at once, without calling
   the producer: `DELIVERY_FAILED`, cause `TopicCoolingDownException(topic, until)`, not retriable, `attempt` = the
   attempts made so far (0 for a first send). One WARN
-  `kafka_publisher_topic_cooling_down channel=… topic=… for=…` marks the start. Other topics on the lane are not delayed.
+  `kafka_publisher_topic_cooling_down channel=… topic=… for=…` marks the start. Other topics on the lane are not delayed,
+  except by the re-probe (see Recovery): each one, once per cool-down period, can stall one lane for up to `max-block-ms`.
 - **Recovery.** The first send after the cool-down checks the topic again (one send per channel; the others keep
   failing fast meanwhile). If the topic is back, the cool-down ends; if not, it starts again. A cool-down that is over
   and that nobody sends to again is dropped at the next `summary-interval` tick, so a topic that is never used again
@@ -232,6 +233,9 @@ class DeadLetterFailureHandler(private val channels: ObjectProvider<EventPublish
     }
 }
 ```
+
+During `close()` every channel stops accepting before any of them drains, so a failure handler that republishes (a
+dead-letter handler, for one) gets `CHANNEL_UNAVAILABLE` for the failures raised during shutdown.
 
 A handler that throws is logged and skipped; the next handler still runs. Events are best effort: anything still queued
 when the process dies is lost. Must-deliver events need an outbox behind the same `EventPublisher` port.
