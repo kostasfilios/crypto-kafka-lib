@@ -1,6 +1,6 @@
 # crypto-kafka-lib v1.3.0: a reusable async event publisher with an exception-handling layer
 
-**Status:** APPROVED 2026-10-05 (owner).
+**Status:** APPROVED 2026-10-05 (owner). → IMPLEMENTED (PR #1, kostasfilios/crypto-kafka-lib) → RELEASED v1.3.0 2026-10-06 (JitPack com.github.kostasfilios:crypto-kafka-lib:v1.3.0).
 - **Release:** tag `v1.3.0` in `kostasfilios/crypto-kafka-lib`, so the JitPack coordinates do not change, then mirror the commits to `AetherLabs-ExchangesSystem/crypto-kafka-lib`.
 - **Property names and `reporting` defaults:** as below.
 <!-- lifecycle: PROPOSED → APPROVED 2026-10-05 → IMPLEMENTED (PR #n) → RELEASED v1.3.0 <date> -->
