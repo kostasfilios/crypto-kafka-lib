@@ -25,6 +25,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** One enabled channel: serialize on the caller, queue on a lane, send on the lane, classify and retry or fail. */
 internal class ChannelEventPublisher(
@@ -49,6 +50,9 @@ internal class ChannelEventPublisher(
     private val pendingRetries: MutableSet<PendingRetry> = ConcurrentHashMap.newKeySet()
     private val metricsWarnings = RateLimiter<String>(warnInterval, nanoTime)
     private val cooldownNanos = settings.producer.missingTopicCooldown.saturatedNanos()
+
+    /** Records given up as CHANNEL_UNAVAILABLE at shutdown: by close(), or by a lane worker that had just polled one as the lanes halted. */
+    private val abandonedAtShutdown = AtomicInteger()
 
     /** Topic -> monotonic time until which sends to it fail at once: it was missing from the broker's metadata. */
     private val coolingDown = ConcurrentHashMap<String, Long>()
@@ -212,23 +216,33 @@ internal class ChannelEventPublisher(
     }
 
     /**
-     * Phase 2: let the lanes drain until [deadlineNanos] (a `System.nanoTime()` deadline), close the producer with the
-     * time left, then fail whatever is still queued as CHANNEL_UNAVAILABLE, so no future outlives close(), and count it.
+     * Phase 2: let the lanes drain until [deadlineNanos] (a `System.nanoTime()` deadline). That deadline is the cut-off:
+     * the lanes are halted (no worker starts another record), whatever is still queued fails as CHANNEL_UNAVAILABLE, so
+     * no future outlives close(), and is counted; only then is the producer closed with the time left. A record that was
+     * queued at the deadline is therefore never sent into a closing producer (it would fail as SEND_REJECTED, uncounted).
      */
     fun finishClose(deadlineNanos: Long) {
         lanes.awaitDrained(deadlineNanos)
+        val queued = lanes.haltAndTakeRemaining().filterIsInstance<LaneTask>()
+        try {
+            queued.forEach { it.abandon(CHANNEL_UNAVAILABLE, null) }
+        } finally {
+            closeProducer(deadlineNanos) // whatever happened above
+        }
+        lanes.awaitDrained(System.nanoTime() + IN_FLIGHT_GRACE_NANOS) // in-flight sends return once the producer is closed
+        val abandoned = abandonedAtShutdown.get()
+        if (abandoned > 0) logger.warn("kafka_publisher_shutdown_abandoned channel={} count={}", channel, abandoned)
+    }
+
+    private fun closeProducer(deadlineNanos: Long) {
         try {
             sender.close(Duration.ofNanos((deadlineNanos - System.nanoTime()).coerceAtLeast(0)))
         } catch (e: Throwable) {
             logger.warn("kafka_publisher_producer_close_failed channel={}: {}", channel, describe(e))
         }
-        val abandoned = lanes.takeRemaining().filterIsInstance<LaneTask>()
-        abandoned.forEach { it.abandon(CHANNEL_UNAVAILABLE, null) }
-        lanes.awaitDrained(System.nanoTime() + IN_FLIGHT_GRACE_NANOS) // in-flight sends return once the producer is closed
-        if (abandoned.isNotEmpty()) logger.warn("kafka_publisher_shutdown_abandoned channel={} count={}", channel, abandoned.size)
     }
 
-    /** Stop accepting, fail pending retries, drain until the shutdown timeout, close the producer, give up the rest. */
+    /** Stop accepting, fail pending retries, drain until the shutdown timeout, give up the rest, close the producer. */
     fun close() {
         if (beginClose()) finishClose(System.nanoTime() + settings.shutdownTimeout.saturatedNanos())
     }
@@ -250,8 +264,10 @@ internal class ChannelEventPublisher(
     ) : LaneTask {
         override fun run() = send(record, attempt, result)
 
-        override fun abandon(stage: PublishFailureStage, cause: Throwable?) =
+        override fun abandon(stage: PublishFailureStage, cause: Throwable?) {
+            if (stage == CHANNEL_UNAVAILABLE) abandonedAtShutdown.incrementAndGet()
             failures.fail(stage, record.topic, record.key, attempt - 1, cause ?: previousError, record.payload, result)
+        }
     }
 
     /** A scheduled retry. Exactly one of run (the delay passed) and abandon (the channel closed) acts on it. */

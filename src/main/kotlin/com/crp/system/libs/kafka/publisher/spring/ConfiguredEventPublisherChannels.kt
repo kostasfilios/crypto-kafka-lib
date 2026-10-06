@@ -59,8 +59,8 @@ internal class ConfiguredEventPublisherChannels private constructor(
 
     /**
      * Every channel stops accepting at once, then all drain against one shared deadline (the longest shutdown timeout,
-     * so shutdown takes the longest timeout, not the sum); each closes its producer and fails what is still queued.
-     * Then the maintenance thread stops and the summaries are flushed once more.
+     * so shutdown takes the longest timeout, not the sum); each then fails what is still queued and closes its
+     * producer. Then the maintenance thread stops and the summaries are flushed once more.
      */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return

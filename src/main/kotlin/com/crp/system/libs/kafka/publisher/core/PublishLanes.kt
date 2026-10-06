@@ -1,5 +1,6 @@
 package com.crp.system.libs.kafka.publisher.core
 
+import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.CHANNEL_UNAVAILABLE
 import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.INTERNAL
 import com.crp.system.libs.kafka.publisher.spring.OrderingMode
 import org.slf4j.LoggerFactory
@@ -25,14 +26,24 @@ internal class PublishLanes(channel: String, count: Int, totalCapacity: Int, pri
     /** Lets every lane drain until [deadlineNanos] (a `System.nanoTime()` deadline). */
     fun awaitDrained(deadlineNanos: Long) = lanes.forEach { it.awaitDrained(deadlineNanos) }
 
-    /** Takes whatever is still queued out of every lane. */
-    fun takeRemaining(): List<Runnable> = lanes.flatMap { it.takeRemaining() }
+    /**
+     * The shutdown cut-off. Every lane is halted first, so no worker starts another task; only then is what is still
+     * queued taken. The result is what was queued when the lanes stopped, whatever the workers were doing. (A task a
+     * worker had just polled is given up by the worker itself, see [PublishLane.halt].)
+     */
+    fun haltAndTakeRemaining(): List<Runnable> {
+        lanes.forEach { it.halt() }
+        return lanes.flatMap { it.takeRemaining() }
+    }
 }
 
 /** One worker thread over one bounded queue. JDK only: no Reactor in the lib. */
 internal class PublishLane(val name: String, capacity: Int) {
     private val queue = ArrayBlockingQueue<Runnable>(capacity)
     @Volatile private var accepting = true
+
+    /** Set by [halt]: the worker starts no further task, whatever is still queued. */
+    @Volatile private var halted = false
     private val restarted = AtomicBoolean(false)
     @Volatile private var worker: Thread = startWorker()
 
@@ -48,7 +59,17 @@ internal class PublishLane(val name: String, capacity: Int) {
         accepting = false
     }
 
-    /** Waits until the worker has left (its queue drained) or [deadlineNanos]; follows a restarted worker. */
+    /**
+     * The shutdown cut-off: the lane accepts nothing more and its worker starts no further task (the one it is running
+     * finishes). Call [takeRemaining] after it for what was still queued. A task the worker polled just as the lane
+     * halted is not in that list: the worker gives it up itself, as CHANNEL_UNAVAILABLE.
+     */
+    fun halt() {
+        accepting = false
+        halted = true
+    }
+
+    /** Waits until the worker has left (its queue drained, or the lane halted) or [deadlineNanos]; follows a restarted worker. */
     fun awaitDrained(deadlineNanos: Long) {
         try {
             while (true) {
@@ -87,12 +108,13 @@ internal class PublishLane(val name: String, capacity: Int) {
     }
 
     private fun loop() {
-        while (accepting || queue.isNotEmpty()) {
+        while (!halted && (accepting || queue.isNotEmpty())) {
             val task = try {
                 queue.poll(100, TimeUnit.MILLISECONDS)
             } catch (e: InterruptedException) {
                 null
             } ?: continue
+            if (halted) return refuse(task) // the lane halted while the worker was polling: this task was still queued then
             try {
                 task.run()
             } catch (e: Throwable) {
@@ -100,6 +122,11 @@ internal class PublishLane(val name: String, capacity: Int) {
                 logger.error("kafka_publisher_lane_task_failed lane={}: {}", name, e.toString())
             }
         }
+    }
+
+    /** A task polled just as the lane halted is failed with the rest, not sent: it would go to a producer that is about to close. */
+    private fun refuse(task: Runnable) {
+        if (task is LaneTask) quietly { task.abandon(CHANNEL_UNAVAILABLE, null) }
     }
 
     /**

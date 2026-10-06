@@ -4,7 +4,9 @@ import com.crp.system.libs.kafka.publisher.api.PublishFailure
 import com.crp.system.libs.kafka.publisher.api.PublishFailureHandler
 import com.crp.system.libs.kafka.publisher.api.PublishFailureStage
 import com.crp.system.libs.kafka.publisher.api.PublisherMetrics
+import com.crp.system.libs.kafka.publisher.core.LaneTask
 import com.crp.system.libs.kafka.publisher.core.OutboundRecord
+import com.crp.system.libs.kafka.publisher.core.PublishLane
 import com.crp.system.libs.kafka.publisher.core.RecordSender
 import com.crp.system.libs.kafka.publisher.core.SendOutcome
 import java.time.Clock
@@ -12,11 +14,13 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
+import java.util.concurrent.BlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
@@ -112,6 +116,24 @@ internal class FakeRecordSender(@Volatile var script: SendScript = deliver()) : 
             return { record, index, onOutcome -> (if (record.key == key) blocking else normal)(record, index, onOutcome) }
         }
     }
+}
+
+/** A lane task that records what happened to it: whether it ran, and every time it was given up (stage and cause). */
+internal class RecordingTask : LaneTask {
+    val ran = AtomicBoolean()
+    val abandoned = CopyOnWriteArrayList<Pair<PublishFailureStage, Throwable?>>()
+    override fun run() = ran.set(true)
+    override fun abandon(stage: PublishFailureStage, cause: Throwable?) {
+        abandoned += stage to cause
+    }
+}
+
+/** What an offer that got past the accepting check just before a halt does: it lands in the queue, as that race would. */
+internal fun PublishLane.offerPastTheAcceptingCheck(task: Runnable) {
+    val queueField = PublishLane::class.java.getDeclaredField("queue").apply { isAccessible = true }
+    @Suppress("UNCHECKED_CAST")
+    val queue = queueField.get(this) as BlockingQueue<Runnable>
+    check(queue.offer(task)) { "the lane's queue is full" }
 }
 
 /** Collects failures; [awaitFailures] blocks until n arrived. */

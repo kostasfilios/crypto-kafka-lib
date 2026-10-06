@@ -1,17 +1,21 @@
 package com.crp.system.libs.kafka.publisher.core
 
 import ch.qos.logback.classic.Level
+import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.CHANNEL_UNAVAILABLE
 import com.crp.system.libs.kafka.publisher.spring.ChannelSettings
 import com.crp.system.libs.kafka.publisher.spring.OrderingMode
 import com.crp.system.libs.kafka.publisher.testsupport.FakeRecordSender
 import com.crp.system.libs.kafka.publisher.testsupport.Harness
 import com.crp.system.libs.kafka.publisher.testsupport.LogCapture
+import com.crp.system.libs.kafka.publisher.testsupport.RecordingTask
 import com.crp.system.libs.kafka.publisher.testsupport.SampleEvent
 import com.crp.system.libs.kafka.publisher.testsupport.Threads
 import com.crp.system.libs.kafka.publisher.testsupport.awaitResult
 import com.crp.system.libs.kafka.publisher.testsupport.eventually
+import com.crp.system.libs.kafka.publisher.testsupport.offerPastTheAcceptingCheck
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.fail
 import org.junit.jupiter.api.Test
 import java.time.Duration
 import java.util.concurrent.CopyOnWriteArrayList
@@ -256,6 +260,74 @@ class PublishLanesTest {
         val admittedTaken = PublishLane::class.java.getDeclaredMethod("admitted", Runnable::class.java, Boolean::class.javaPrimitiveType)
             .apply { isAccessible = true }.invoke(lane, alreadyTaken, true) as Boolean
         assertThat(admittedTaken).isTrue()
+    }
+
+    @Test
+    fun `halting stops the worker before it takes another task, which stays queued for the caller to take`() {
+        val lane = PublishLane("halt-publisher-0", 10)
+        cleanups += { lane.halt(); lane.awaitDrained(System.nanoTime() + 2_000_000_000) }
+        val gate = CountDownLatch(1)
+        cleanups += { gate.countDown() }
+        val running = CountDownLatch(1)
+        lane.tryEnqueue { running.countDown(); gate.await(10, TimeUnit.SECONDS) }
+        assertThat(running.await(5, TimeUnit.SECONDS)).isTrue()
+        val queued = List(3) { RecordingTask() }.onEach { assertThat(lane.tryEnqueue(it)).isTrue() }
+
+        lane.halt()
+        gate.countDown() // the worker finishes the task it is running, and must not take another
+        lane.awaitDrained(System.nanoTime() + 5_000_000_000)
+
+        assertThat(Threads.named("halt-publisher-0")).isEmpty() // it left
+        assertThat(queued).noneMatch { it.ran.get() || it.abandoned.isNotEmpty() } // and left them alone
+        assertThat(lane.takeRemaining()).containsExactlyElementsOf(queued)
+        assertThat(lane.tryEnqueue {}).isFalse()
+    }
+
+    @Test
+    fun `haltAndTakeRemaining halts every lane, then returns what each of them still had queued`() {
+        val lanes = lanes("cutoff", 2, 20)
+        val gate = CountDownLatch(1)
+        cleanups += { gate.countDown() }
+        val running = CountDownLatch(2)
+        val laneList = (0 until 100).map { lanes.forKey(null) }.distinct()
+        assertThat(laneList).hasSize(2)
+        laneList.forEach { lane -> lane.tryEnqueue { running.countDown(); gate.await(10, TimeUnit.SECONDS) } }
+        assertThat(running.await(5, TimeUnit.SECONDS)).isTrue()
+        val queued = laneList.flatMap { lane -> List(2) { RecordingTask() }.onEach { assertThat(lane.tryEnqueue(it)).isTrue() } }
+
+        val remaining = lanes.haltAndTakeRemaining()
+        gate.countDown()
+        lanes.awaitDrained(System.nanoTime() + 5_000_000_000)
+
+        assertThat(remaining).containsExactlyInAnyOrderElementsOf(queued)
+        assertThat(queued).noneMatch { it.ran.get() }
+        assertThat(laneList).noneMatch { it.tryEnqueue {} }
+    }
+
+    @Test
+    fun `a worker that polls a task just as its lane halts fails it as CHANNEL_UNAVAILABLE and does not run it`() {
+        // Each worker must still be polling when the halt comes and each task must land right after it. When this thread
+        // is held up for the rest of a 100 ms poll, a worker leaves first and the attempt is made again.
+        repeat(20) { attempt ->
+            val name = "refuse$attempt-${System.nanoTime()}"
+            val lanes = PublishLanes(name, 2, 4, OrderingMode.NONE)
+            val workers = (0..1).map { n -> Thread.getAllStackTraces().keys.single { it.name == "$name-publisher-$n" } }
+            workers.forEach { worker -> eventually { worker.state == Thread.State.TIMED_WAITING } } // polling an empty queue
+            val laneList = (0..1).map { lanes.forKey(null) }
+            val tasks = List(2) { RecordingTask() }
+
+            val remaining = lanes.haltAndTakeRemaining()
+            laneList.zip(tasks).forEach { (lane, task) -> lane.offerPastTheAcceptingCheck(task) }
+            lanes.awaitDrained(System.nanoTime() + 5_000_000_000)
+
+            if (tasks.all { it.abandoned.isNotEmpty() }) {
+                assertThat(remaining).isEmpty()
+                assertThat(tasks).allMatch { task -> !task.ran.get() && task.abandoned.single() == (CHANNEL_UNAVAILABLE to null) }
+                assertThat(Threads.awaitGone("$name-publisher-")).isEmpty()
+                return
+            }
+        }
+        fail<Unit>("no attempt had both workers poll the task that was offered after the halt")
     }
 
     @Test

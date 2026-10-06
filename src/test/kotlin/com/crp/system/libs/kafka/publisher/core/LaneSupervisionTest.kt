@@ -7,6 +7,7 @@ import com.crp.system.libs.kafka.publisher.spring.ChannelSettings
 import com.crp.system.libs.kafka.publisher.testsupport.FakeRecordSender
 import com.crp.system.libs.kafka.publisher.testsupport.Harness
 import com.crp.system.libs.kafka.publisher.testsupport.LogCapture
+import com.crp.system.libs.kafka.publisher.testsupport.RecordingTask
 import com.crp.system.libs.kafka.publisher.testsupport.SampleEvent
 import com.crp.system.libs.kafka.publisher.testsupport.Threads
 import com.crp.system.libs.kafka.publisher.testsupport.awaitFailure
@@ -15,7 +16,6 @@ import com.crp.system.libs.kafka.publisher.testsupport.eventually
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -33,15 +33,6 @@ class LaneSupervisionTest {
     private fun poison() = Runnable {
         throw object : RuntimeException() {
             override fun toString(): String = throw Poisoned()
-        }
-    }
-
-    private class RecordingTask : LaneTask {
-        val ran = AtomicBoolean()
-        val abandoned = CopyOnWriteArrayList<Pair<PublishFailureStage, Throwable?>>()
-        override fun run() = ran.set(true)
-        override fun abandon(stage: PublishFailureStage, cause: Throwable?) {
-            abandoned += stage to cause
         }
     }
 

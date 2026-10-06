@@ -1,6 +1,8 @@
 package com.crp.system.libs.kafka.publisher.core
 
+import com.crp.system.libs.kafka.publisher.api.PublishFailureHandler
 import com.crp.system.libs.kafka.publisher.api.PublishFailureStage.CHANNEL_UNAVAILABLE
+import com.crp.system.libs.kafka.publisher.api.PublishResult
 import ch.qos.logback.classic.Level
 import com.crp.system.libs.kafka.publisher.spring.ChannelSettings
 import com.crp.system.libs.kafka.publisher.testsupport.FakeRecordSender
@@ -11,13 +13,18 @@ import com.crp.system.libs.kafka.publisher.testsupport.Threads
 import com.crp.system.libs.kafka.publisher.testsupport.awaitFailure
 import com.crp.system.libs.kafka.publisher.testsupport.awaitResult
 import com.crp.system.libs.kafka.publisher.testsupport.eventually
+import com.crp.system.libs.kafka.publisher.testsupport.offerPastTheAcceptingCheck
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Assertions.assertDoesNotThrow
+import org.junit.jupiter.api.Assertions.fail
 import org.junit.jupiter.api.Test
 import java.time.Duration
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class ShutdownTest {
     private val event = SampleEvent("x", "1")
@@ -95,6 +102,53 @@ class ShutdownTest {
     }
 
     @Test
+    fun `the producer is closed only after every record queued at the deadline has been failed`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val queued = CopyOnWriteArrayList<CompletableFuture<PublishResult>>()
+        val failedWhenClosed = AtomicInteger(-1)
+        // closing the producer wakes the send that is blocked in it, as KafkaProducer.close does: the lane is free from that moment
+        val sender = FakeRecordSender(FakeRecordSender.stuck(entered, release)).apply {
+            onClose = {
+                failedWhenClosed.set(queued.count { it.isDone })
+                release.countDown()
+            }
+        }
+        val h = Harness(ChannelSettings(enabled = true, lanes = 1, queueCapacity = 100, shutdownTimeout = Duration.ofMillis(200)), sender)
+        h.publisher.publish("t1", "k1", event)
+        assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue()
+        repeat(49) { queued += h.publisher.publishWithResult("t1", "k${it + 2}", event) }
+
+        h.publisher.close()
+
+        // all 49 were failed before the producer closed, so the freed lane had nothing left to send into it
+        assertThat(failedWhenClosed.get()).isEqualTo(49)
+        assertThat(queued.map { it.awaitFailure().stage }).containsOnly(CHANNEL_UNAVAILABLE)
+        assertThat(h.sender.calls).hasSize(1)
+    }
+
+    @Test
+    fun `a lane that is still draining at the deadline stops there, and every record is either sent or abandoned and counted`() {
+        val sender = FakeRecordSender { record, index, onOutcome ->
+            Thread.sleep(10) // a send takes a while, so 150 records cannot drain in 300 ms
+            FakeRecordSender.deliver()(record, index, onOutcome)
+        }
+        val h = Harness(ChannelSettings(enabled = true, lanes = 1, queueCapacity = 200, shutdownTimeout = Duration.ofMillis(300)), sender)
+        LogCapture(ChannelEventPublisher::class.java).use { logs ->
+            val results = (1..150).map { h.publisher.publishWithResult("t1", "k$it", event) }
+
+            h.publisher.close()
+
+            assertThat(results).allMatch { it.isDone } // nothing outlives close()
+            val abandoned = results.filter { it.isCompletedExceptionally }.map { it.awaitFailure() }
+            assertThat(abandoned).isNotEmpty()
+            assertThat(abandoned).allMatch { it.stage == CHANNEL_UNAVAILABLE && it.attempt == 0 }
+            assertThat(h.sender.calls.size + abandoned.size).isEqualTo(150) // none sent twice, none lost
+            assertThat(logs.lines(Level.WARN)).containsExactly("kafka_publisher_shutdown_abandoned channel=${h.channel} count=${abandoned.size}")
+        }
+    }
+
+    @Test
     fun `only queued records are failed and counted at shutdown, another task in a lane is just dropped`() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -113,6 +167,62 @@ class ShutdownTest {
             assertThat(foreignRan.get()).isFalse()
             assertThat(logs.lines(Level.WARN)).containsExactly("kafka_publisher_shutdown_abandoned channel=${h.channel} count=2")
         }
+    }
+
+    /** Admits like DROP, except that it keeps back the [heldCall]th record: the test puts that one into its lane later. */
+    private class HoldBack(private val heldCall: Int) : BackpressurePolicy {
+        private val calls = AtomicInteger()
+        @Volatile var held: Pair<PublishLane, Runnable>? = null
+
+        override fun admit(lane: PublishLane, task: Runnable): Boolean {
+            if (calls.incrementAndGet() != heldCall) return lane.tryEnqueue(task)
+            held = lane to task
+            return true
+        }
+    }
+
+    @Test
+    fun `a record a worker had just polled when close halted the lanes is failed as CHANNEL_UNAVAILABLE and counted with the rest`() {
+        // It takes an idle worker that is still polling when close() halts the lanes, and a record that lands in its queue
+        // right after, as a publish that passed the accepting check just before close() would. The failure handler of the
+        // first abandoned record puts it there. When the closing thread is held up for the rest of the worker's 100 ms
+        // poll, the worker leaves first and the attempt is made again.
+        val busyKey = "player-1"
+        val idleKey = (2..1_000).map { "player-$it" }.first { Math.floorMod(it.hashCode(), 2) != Math.floorMod(busyKey.hashCode(), 2) }
+        repeat(20) {
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val sender = FakeRecordSender(FakeRecordSender.stuckFor(busyKey, entered, release)).apply { onClose = { release.countDown() } }
+            val holdBack = HoldBack(heldCall = 4)
+            val offered = AtomicBoolean(false)
+            val offerTheHeldRecord = PublishFailureHandler { failure ->
+                val (lane, task) = holdBack.held!!
+                if (failure.key == busyKey && offered.compareAndSet(false, true)) lane.offerPastTheAcceptingCheck(task)
+            }
+            val h = Harness(
+                ChannelSettings(enabled = true, lanes = 2, queueCapacity = 20, shutdownTimeout = Duration.ZERO),
+                sender,
+                backpressure = holdBack,
+                extraHandlers = listOf(offerTheHeldRecord),
+            )
+            LogCapture(ChannelEventPublisher::class.java).use { logs ->
+                h.publisher.publish("t1", busyKey, event) // stuck in the producer
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue()
+                val queued = (1..2).map { h.publisher.publishWithResult("t1", busyKey, event) } // queued behind it
+                val late = h.publisher.publishWithResult("t1", idleKey, event) // the idle lane never gets it, until the handler offers it
+
+                h.publisher.close()
+
+                assertThat(queued.map { it.awaitFailure().stage }).containsOnly(CHANNEL_UNAVAILABLE)
+                if (late.isDone) { // the idle worker polled it after the halt
+                    assertThat(late.awaitFailure().stage).isEqualTo(CHANNEL_UNAVAILABLE)
+                    assertThat(h.sender.calls).hasSize(1) // it was not sent
+                    assertThat(logs.lines(Level.WARN)).containsExactly("kafka_publisher_shutdown_abandoned channel=${h.channel} count=3")
+                    return
+                }
+            }
+        }
+        fail<Unit>("no attempt had the idle worker poll the record that was offered after the halt")
     }
 
     @Test

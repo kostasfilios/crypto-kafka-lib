@@ -203,9 +203,11 @@ is enabled.
 queued records as `INTERNAL` (ERROR `kafka_publisher_lane_dead … abandoned=N`) instead of stranding them.
 
 **Shutdown.** Every channel stops accepting at once and fails its pending retries. Then all lanes drain against one
-shared deadline, the longest `shutdown-timeout`, so shutdown takes the longest timeout, not the sum. Each channel then
-closes its producer with the time left. Records still queued after that fail as `CHANNEL_UNAVAILABLE` before `close()`
-returns (WARN `kafka_publisher_shutdown_abandoned channel=… count=N`, logged before the final summaries). Sends still
+shared deadline, the longest `shutdown-timeout`, so shutdown takes the longest timeout, not the sum. When the lanes
+have drained or the deadline passes, each channel halts its lanes (no worker starts another record) and fails whatever
+is still queued as `CHANNEL_UNAVAILABLE` before `close()` returns (WARN
+`kafka_publisher_shutdown_abandoned channel=… count=N`, logged before the final summaries). Only then does it close its
+producer with the time left, so nothing that was queued at the deadline is sent into a closing producer. Sends still
 inside the producer return once it is closed; close waits up to 1 s more for them.
 
 ### Adding a failure handler
